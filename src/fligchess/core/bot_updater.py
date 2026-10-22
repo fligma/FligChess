@@ -105,25 +105,34 @@ def fetch_index():
     return index
 
 
-def local_version(path):
-    """Import just this bot file and read its class version; None when the
-    file is missing or fails to load."""
+def probe(path):
+    """Import just this bot file and read its advertised class attributes;
+    returns (version, modes, name) - all None when the file is missing or
+    fails to load. `modes` is the class's MODES tuple (bots written before
+    the mode API existed report ("2p",), the class default)."""
     import importlib.util
     from fligchess.core.bot_api import Bot
     if not path.is_file():
-        return None
+        return (None, None, None)
     try:
         spec = importlib.util.spec_from_file_location(
             "fligchess_probe_" + path.stem, path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception:
-        return None
+        return (None, None, None)
     for obj in vars(module).values():
         if (isinstance(obj, type) and issubclass(obj, Bot)
                 and obj is not Bot and getattr(obj, "name", None)):
-            return getattr(obj, "version", None)
-    return None
+            modes = tuple(getattr(obj, "MODES", ("2p",)) or ("2p",))
+            return (getattr(obj, "version", None), modes,
+                    getattr(obj, "name", None))
+    return (None, None, None)
+
+
+def local_version(path):
+    """Just the version half of probe(); None when unreadable."""
+    return probe(path)[0]
 
 
 def bundled_versions():
@@ -154,11 +163,16 @@ def check():
         path = directory / fname
         digest = ("sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
                   if path.is_file() else None)
+        version, modes, _ = probe(path) if path.is_file() else (None, None, None)
+        if modes is None:
+            listed = entry.get("modes")
+            modes = tuple(listed) if isinstance(listed, list) else None
         entries.append({
             "name": name,
             "file": fname,
             "remote": int(entry.get("version", 0)),
-            "local": local_version(path) if path.is_file() else None,
+            "local": version,
+            "modes": modes,
             "hash": entry.get("sha256", ""),
             "app": entry.get("app", ""),
             "current": digest == entry.get("sha256"),

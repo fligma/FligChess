@@ -1,15 +1,15 @@
 """A tiny built-in mover for the four-player cross board.
 
-The shipped bot (``fligbot``) is a two-player engine and is deliberately not
-retrofitted for four armies this release, so a 4-player game - an offline AI
-seat, or a host that chose to play as an engine - needs its own driver. This
-is that driver: a greedy picker, no search, so an AI seat is always filled
+A 4-player game - an offline AI seat, or a host that chose to play as an
+engine - needs a mover even when no four-army bot is installed or seated, so
+this is that mover: a greedy picker, no search, an AI seat is always filled
 and the built-in mover is a dependency-free safety net rather than a rival
-engine.
+engine. A real four-army bot (``fligbot classic 4p``) can be opted in per
+seat; when a seat names none - or that bot fails - the game falls back here.
 
 It reads only ``board4`` and returns a plain ``Move``; nothing here touches
-the app or the ``Bot`` interface, so a real four-army bot could replace it
-later without disturbing anything.
+the app or the ``Bot`` interface, so seating a stronger engine never
+disturbs it.
 """
 
 import random

@@ -124,6 +124,21 @@ class ChessGame:
 # Names shown for each army in the four-player game's status and result text.
 ARMY_NAMES = {"w": "White", "b": "Black", "r": "Red", "bl": "Blue"}
 
+# A cross game ends only on elimination, so evenly-matched armies can shuffle
+# forever. Two safeguards break a stall; both are recomputed from the move
+# list alone, so an undo replays to exactly the same state.
+DRAW4 = "draw"          # result sentinel when the absolute cap was reached
+REP_CAP = 4             # position offered to a mover this many times -> it loses
+MAX_PLIES4 = 1500       # last-resort ceiling so a 4P game always terminates
+RECENT_WINDOW = 24      # last offered positions a cross engine is warned about
+
+
+def _sig4(board):
+    """The repetition signature of a cross position: pieces + turn + en
+    passant, the move counters dropped. The bot API reads the same first four
+    FEN fields, so a classic engine's own view and the game's counts agree."""
+    return " ".join(board.to_fen().split()[:4])
+
 
 class Game4:
     """A free-for-all on the cross board: four armies, turn order white,
@@ -139,7 +154,10 @@ class Game4:
         self.moves = []            # every move played, across all armies
         self.eliminated = []       # (army, reason) in the order they fell
         self.resigned = None       # army that resigned, ends for it
-        self._resolve()
+        self.repetitions = {}      # position signature -> times offered to a mover
+        self.recent = []           # last offered positions, newest last
+        self.capped = False        # hit MAX_PLIES4 while two-plus armies shuffled
+        self._advance()
 
     # ------------------------------------------------------------- queries
 
@@ -155,7 +173,10 @@ class Game4:
                 if a not in self.board.out and self.board.has_king(a)]
 
     def result(self):
-        """None while the game runs; otherwise the winner's army id."""
+        """None while the game runs; otherwise the winner's army id, or the
+        DRAW4 sentinel when the absolute progress cap was reached."""
+        if self.capped:
+            return DRAW4
         if self.resigned:
             # the resigner is gone; the last of the others wins outright
             alive = [a for a in self.standing() if a != self.resigned]
@@ -165,6 +186,8 @@ class Game4:
 
     def status_text(self):
         winner = self.result()
+        if winner == DRAW4:
+            return "Draw - no progress"
         if winner:
             return "%s wins - last king standing" % ARMY_NAMES[winner]
         turn = self.board.turn
@@ -178,8 +201,43 @@ class Game4:
             raise ValueError("Illegal move: %s" % (move,))
         self.board.make_move(move)
         self.moves.append(move)
-        self._resolve()
+        self._advance()
         return move
+
+    # ------------------------------------------------- repetition and stalling
+
+    def _position_key4(self):
+        """Pieces + turn + en passant, counters ignored: the exact state a
+        mover is offered, so a shuffle shows up as the same key recurring."""
+        return _sig4(self.board)
+
+    def _record_position(self):
+        key = self._position_key4()
+        self.repetitions[key] = self.repetitions.get(key, 0) + 1
+        self.recent.append(key)
+        if len(self.recent) > RECENT_WINDOW:
+            del self.recent[:-RECENT_WINDOW]
+
+    def _advance(self):
+        """Settle the game after a move: sweep eliminations, count the
+        position now offered to the mover, and evict that mover once it is
+        the REP_CAP-th time round for the same position. The armies that have
+        not been looping stay in play; only a last-standing (or capped) state
+        ends the game. The whole thing is a pure function of the move list."""
+        self._resolve()
+        if self.result() is not None:
+            return
+        self._record_position()
+        turn = self.board.turn
+        if (turn is not None and len(self.standing()) > 1
+                and self.repetitions.get(self._position_key4(), 0)
+                >= REP_CAP):
+            self.board.remove_army(turn)
+            self.eliminated.append((turn, "repetition"))
+            self._resolve()
+        if (self.result() is None and not self.capped
+                and len(self.moves) >= MAX_PLIES4):
+            self.capped = True
 
     def resign(self, army):
         """An army drops out; everyone else keeps playing to last-standing."""

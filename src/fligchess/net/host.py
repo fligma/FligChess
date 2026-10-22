@@ -1097,10 +1097,26 @@ def _make_handler(host):
                 # really handed to whoever is already waiting on the game
                 snap["seat_open"] = host.seat_open("web")
                 snap["seat_colors"] = host.seat_colors("web")
-            # keep the player's own payload lean; a spectator (and a LAN peer,
-            # who is also the mover) is the one who wants the review history
-            if host.web and token != VIEWER:
+            # keep the player's own payload lean: a seated player - web or app
+            # - never gets the move history, since they could scrub back to a
+            # frame where a hidden piece still stood; a spectator keeps a
+            # masked copy of it instead
+            if token == GUEST:
                 snap.pop("plies", None)
+            # blank the pieces this viewer may not see straight into the
+            # transmitted grids, so a hidden piece never reaches any client,
+            # not even in the markup. A seated army is masked by its own fog;
+            # a spectator by the union fog, and tinted by the seeing teams
+            if token == VIEWER:
+                _mask_snap(snap, snap.get("spec_fog"))
+                snap["tint"] = snap.get("spec_tint") or {}
+            else:
+                # a seated army is masked by its own fog; the union fog and
+                # tint (which say which enemies can see a tile) are a
+                # spectator's only, so drop them from a player's payload
+                _mask_snap(snap, snap.get("fog"))
+                for secret in ("spec_fog", "spec_tint", "tint"):
+                    snap.pop(secret, None)
             self._json(snap, extra=extra)
 
         def _seat(self):
@@ -1192,6 +1208,69 @@ def _make_handler(host):
                        extra=[("Set-Cookie", _nick_cookie(value))])
 
     return Handler
+
+
+def _mask_grid_2p(rows, names):
+    """Blank every piece on a two-player `rows` grid whose square name is in
+    `names`, so a hidden piece never leaves the server. Rows run rank 8 first;
+    a name like "e2" is file e (column 4), rank 2 (row index 8 - 2 = 6)."""
+    grid = [list(row) for row in rows]
+    for name in names:
+        if not name or len(name) < 2:
+            continue
+        col = ord(name[0]) - ord("a")
+        try:
+            row = 8 - int(name[1])
+        except ValueError:
+            continue
+        if 0 <= row < len(grid) and 0 <= col < len(grid[row]):
+            grid[row][col] = "."
+    return ["".join(r) for r in grid]
+
+
+def _mask_grid_cross(cells, names, off):
+    """Blank every piece on a cross `cells` grid whose coordinate name is in
+    `names`; the cut-out corners (marked `off`) are left exactly as they were.
+    A name like "a14" is file a (column 0), rank 14 (row 13)."""
+    grid = [list(row) for row in cells]
+    for name in names:
+        if not name or len(name) < 2:
+            continue
+        x = ord(name[0]) - ord("a")
+        try:
+            y = int(name[1:]) - 1
+        except ValueError:
+            continue
+        if 0 <= y < len(grid) and 0 <= x < len(grid[y]) and grid[y][x] != off:
+            grid[y][x] = "."
+    return grid
+
+
+def _mask_snap(snap, names):
+    """Blank the transmitted grids (and each review ply) on the squares the
+    resolved viewer may not see. Fresh lists are built every time so the one
+    shared snapshot this shallow copy came from is never mutated."""
+    names = {n for n in (names or []) if n}
+    if not names:
+        return
+    cross = snap.get("four")
+    key = "cells" if cross else "rows"
+    off = snap.get("cross_off", "")
+    if snap.get(key) is not None:
+        snap[key] = (_mask_grid_cross(snap[key], names, off) if cross
+                     else _mask_grid_2p(snap[key], names))
+    if snap.get("plies") is not None:
+        plies = []
+        for ply in snap["plies"]:
+            p = dict(ply)
+            if p.get(key) is not None:
+                # an earlier ply is veiled by the fog it was captured under,
+                # falling back to the viewer's current fog when it has none
+                own = set(p.get("fog") or ()) or names
+                p[key] = (_mask_grid_cross(p[key], own, off) if cross
+                          else _mask_grid_2p(p[key], own))
+            plies.append(p)
+        snap["plies"] = plies
 
 
 def _cookie(role, sid=None):

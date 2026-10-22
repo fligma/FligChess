@@ -53,6 +53,19 @@ _PAWN = {
 # army is equivalent and the four perft branches come out equal.
 _BACK = ["R", "N", "B", "Q", "K", "B", "N", "R"]
 
+
+def _victim_of(target, capturer):
+    """The square holding the pawn an en passant capture on `target` takes.
+
+    A two-square push ends one step past the square it passed, so the victim
+    stands a further step along the capturer's own forward line - the same
+    relation on the cross arms and the classic board, since opposing armies
+    always face back along one axis."""
+    x, y = target
+    fwd = _PAWN[capturer]["fwd"]
+    return (x - fwd[0], y - fwd[1])
+
+
 START_CROSS = (
     "8/8/8/RNBQKBNR/PPPPPPPP/8/8/PPPPPPPP/RNBQKBNR/8/8/8 w - - 0 1")
 
@@ -184,7 +197,10 @@ class Board4:
         b.turn = parts[1] if len(parts) > 1 else WHITE
         if len(parts) > 2 and parts[2] != "-":
             epfile = "abcdefghijklmn".index(parts[2][0])
-            b.ep = ((epfile, int(parts[2][1:]) - 1),)
+            target = (epfile, int(parts[2][1:]) - 1)
+            # the FEN names the square a capture lands on; the pawn it takes
+            # stands one step further along the capturer's own forward line
+            b.ep = (target, _victim_of(target, b.turn))
         if len(parts) > 4:
             b.halfmove = int(parts[4])
         if len(parts) > 5:
@@ -201,7 +217,7 @@ class Board4:
                 row.append(self.grid[y][x] or ".")
             rows.append("".join(row))
         ep = "-"
-        if self.ep and len(self.ep) == 1:
+        if self.ep:
             ep = sq_name(self.ep[0])
         return ("/".join(rows) + " %s %s - %d %d"
                 % (self.turn, ep, self.halfmove, self.fullmove))
@@ -367,8 +383,28 @@ class Board4:
                 self._add_pawn(moves, sq, to, army, spec)
             elif (victim is None and self.ep is not None
                   and to == self.ep[0]
-                  and army_of(self.get(self.ep[1])) == OPPOSITE[army]):
+                  and self._ep_open(army)):
                 moves.append(Move(sq, to))
+
+    def _ep_open(self, army):
+        """Whether the standing en passant window may be taken by `army`: the
+        pawn that opened it must belong to the army `army` is opposed by, and
+        still stand where the push left it."""
+        victim = self._ep_victim(army)
+        if victim is None or not playable(victim):
+            return False
+        code = self.get(victim)
+        return (code is not None and kind_of(code) == "P"
+                and army_of(code) == OPPOSITE[army])
+
+    def _ep_victim(self, army):
+        """The square the ep capture removes; recorded at the push, or worked
+        out from the target when a position was read from text."""
+        if self.ep is None:
+            return None
+        if len(self.ep) > 1 and self.ep[1] is not None:
+            return self.ep[1]
+        return _victim_of(self.ep[0], army)
 
     def _add_pawn(self, moves, frm, to, army, spec):
         coord = to[0] if spec["axis"] == "x" else to[1]
@@ -414,9 +450,11 @@ class Board4:
         captured = self.get(move.to_sq)
         capture_sq = move.to_sq
 
-        # en passant: the captured pawn sits straight behind the target square
-        if kind == "P" and captured is None and self.ep and move.to_sq == self.ep[0]:
-            victim = self.ep[1]
+        # en passant: the captured pawn stands one step ahead of the target,
+        # on the square the two-square push ended on
+        if kind == "P" and captured is None and self.ep \
+                and move.to_sq == self.ep[0] and self._ep_open(army):
+            victim = self._ep_victim(army)
             captured = self.get(victim)
             self.set(victim, None)
             capture_sq = victim
@@ -436,7 +474,7 @@ class Board4:
             coord1 = fx1 if spec["axis"] == "x" else fy1
             if abs(coord1 - coord0) == 2:
                 mid = ((fx0 + fx1) // 2, (fy0 + fy1) // 2)
-                self.ep = (mid, move.from_sq)
+                self.ep = (mid, move.to_sq)
 
         if kind == "P" or captured is not None:
             self.halfmove = 0

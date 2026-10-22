@@ -43,8 +43,10 @@ from fligchess.core import releases       # noqa: E402
 from fligchess.ui import xp               # noqa: E402
 from fligchess.version import APP_VERSION  # noqa: E402
 
-WIN = (540, 380)
+WIN = (560, 420)                  # default size; the window is resizable
+MIN_WIN = (460, 360)              # never lay out below this
 TITLEBAR_H = 28
+EDGE_GRAB = 6                     # band along the border that resizes
 UI_FONT = "tahoma,verdana,segoeui,dejavusans"
 
 # the bubble shown when hovering the token field's "?": when a token is
@@ -61,6 +63,20 @@ TOKEN_TIP = (
     "It is also saved to config/updater.json inside the",
     "install folder, so the app's bot updater uses it too.",
 )
+
+
+def _set_win_app_id():
+    """Claim our own Windows taskbar button (the main app does the same):
+    without an explicit AppUserModelID the shell groups the window under
+    whatever launched it and shows the generic pygame feather instead of
+    the FligChess logo. Windows only, and never fatal."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Fligma.FligChess.Installer")
+    except (OSError, AttributeError):
+        pass
 
 
 def _load_sdl_dll():
@@ -91,8 +107,10 @@ def _load_sdl_dll():
 
 class Installer:
     def __init__(self):
+        _set_win_app_id()           # before the window: taskbar grouping
         pygame.init()
-        self.screen = pygame.display.set_mode(WIN)
+        self.size = WIN
+        self.screen = pygame.display.set_mode(self.size, pygame.RESIZABLE)
         pygame.display.set_caption("Install FligChess")
         self.font = pygame.font.SysFont(UI_FONT, 14)
         self.big = pygame.font.SysFont(UI_FONT, 18, bold=True)
@@ -102,9 +120,8 @@ class Installer:
         self._close_btn = None           # caption close box, set on first draw
         self._win = None                 # the one live SDL window wrapper
         self._dll = _load_sdl_dll()      # for the global mouse while dragging
-        self._drag = None                # active caption drag, see _drag_start
-        self._win_pending = None         # position to apply outside the pump
-        self._applied_pos = None         # last position set, to dedupe moves
+        self._drag = None                # active move/resize grab, see _drag_start
+        self._win_pending = None         # {"pos", "size"} to apply outside the pump
         self._layout()
         self.logo, self.icon = self._load_logo()
         self._apply_icon_and_chrome()
@@ -131,7 +148,7 @@ class Installer:
     # -------------------------------------------------------------- geometry
 
     def _layout(self):
-        w, h = WIN
+        w, h = self.size
         self.title = pygame.Rect(0, 0, w, TITLEBAR_H)
         lx, top = 18, TITLEBAR_H + 16
         self.info_rect = pygame.Rect(lx, top, w - 2 * lx, 54)
@@ -212,55 +229,113 @@ class Installer:
             return None
 
     def _drag_start(self, pos):
-        """Pressing the drawn caption (anywhere but its close box) grabs the
-        window, anchored on the desktop cursor and the window's position, so
-        the whole drag tracks absolute movement instead of accumulating the
-        shaky per-event deltas that made the frame jitter. Returns True when
-        the press was eaten."""
+        """Pressing the drawn caption grabs the window for a move, and the
+        thin band along the border grabs it for a resize. When SDL can report
+        the desktop cursor the drag anchors on it (stable even when the
+        cursor leaves the window); when it cannot - Wayland - the drag falls
+        back to in-window motion, re-anchored after every applied step so
+        the window's own movement never feeds back into the cursor reading.
+        Returns True when the press was eaten."""
         close = getattr(self, "_close_btn", None)
-        if not self.title.collidepoint(pos) or (close and close.collidepoint(pos)):
+        if close and close.collidepoint(pos):
+            return False
+        edges = self._resize_edges(pos)
+        kind = "resize" if edges else (
+            "move" if self.title.collidepoint(pos) else None)
+        if kind is None:
             return False
         win = self._sdlwin()
-        g0 = self._global_mouse()
+        if win is None:
+            return True               # nothing to drag, but eat the press
         try:
-            p0 = win.position if win is not None else None
+            p0 = win.position
         except Exception:
-            p0 = None
-        self._drag = {"g0": g0, "p0": p0}
+            return True
+        g0 = self._global_mouse()
+        d = {"kind": kind, "g0": g0, "p0": p0, "s0": self.size,
+             "edges": edges or ""}
+        if g0 is None:
+            d["base"] = tuple(p0)
+            d["bsize"] = tuple(self.size)
+            d["m_anchor"] = pygame.mouse.get_pos()
+        self._drag = d
         return True
 
-    def _drag_update(self):
-        """During a grab, only record where the window should go; the SDL call
-        happens once per frame in _apply_window_drag, outside the event pump
-        (moving the window while iterating events re-enters the message loop
-        and floods synthetic motion, which is what caused the jitter)."""
+    def _resize_edges(self, pos):
+        """Which border band the point grabs: a string of l/r/t/b."""
+        w, h = self.size
+        return "".join(n for n, on in (
+            ("l", pos[0] < EDGE_GRAB), ("r", pos[0] >= w - EDGE_GRAB),
+            ("t", pos[1] < EDGE_GRAB),
+            ("b", pos[1] >= h - EDGE_GRAB)) if on)
+
+    def _drag_update(self, rel):
+        """During a grab, only record where the window should go; the SDL
+        call happens once per frame in _apply_window_drag, outside the event
+        pump (moving the window while iterating events re-enters the message
+        loop and floods synthetic motion, which caused the old jitter)."""
         d = self._drag
-        if not d or d["g0"] is None or d["p0"] is None:
+        if not d:
             return
-        g = self._global_mouse()
-        if g is None:
-            return
-        dx, dy = g[0] - d["g0"][0], g[1] - d["g0"][1]
-        self._win_pending = (int(d["p0"][0] + dx), int(d["p0"][1] + dy))
+        if d.get("g0") is not None:
+            g = self._global_mouse()
+            if g is None:
+                return
+            dx, dy = g[0] - d["g0"][0], g[1] - d["g0"][1]
+            base, bsize = d["p0"], d["s0"]
+        else:
+            m = pygame.mouse.get_pos()
+            dx, dy = m[0] - d["m_anchor"][0], m[1] - d["m_anchor"][1]
+            base, bsize = d["base"], d["bsize"]
+        if d["kind"] == "resize":
+            e = d["edges"]
+            x, y = base
+            w, h = bsize
+            if "r" in e:
+                w = max(MIN_WIN[0], w + dx)
+            if "b" in e:
+                h = max(MIN_WIN[1], h + dy)
+            if "l" in e:
+                right = x + w             # the far edge stays pinned
+                w = max(MIN_WIN[0], w - dx)
+                x = right - w
+            if "t" in e:
+                bottom = y + h
+                h = max(MIN_WIN[1], h - dy)
+                y = bottom - h
+            self._win_pending = {"pos": (int(x), int(y)),
+                                 "size": (int(w), int(h))}
+        else:
+            self._win_pending = {"pos": (int(base[0] + dx),
+                                         int(base[1] + dy))}
 
     def _apply_window_drag(self):
-        """Move the borderless window once per frame, after the pump. A target
-        identical to the last one applied is skipped, so a still cursor that
-        SDL still reports motion for cannot keep nudging the frame."""
-        pos = self._win_pending
-        if not pos:
+        """Move/resize the borderless window once per frame, after the pump.
+        In the relative-motion fallback the anchors follow whatever was
+        actually applied, so synthetic motion from the move cancels itself."""
+        p = self._win_pending
+        if not p:
             return
         self._win_pending = None
-        if pos == self._applied_pos:
-            return
         win = self._sdlwin()
         if win is None:
             return
+        pos, size = p.get("pos"), p.get("size")
         try:
-            win.position = pos
-            self._applied_pos = pos
+            if size:
+                win.size = size
+            if pos:
+                win.position = pos
         except Exception:
             self._drag = None
+            return
+        d = self._drag
+        if d is not None and d.get("g0") is None:
+            if pos:
+                d["base"] = pos
+            if size:
+                d["bsize"] = size
+            d["m_anchor"] = pygame.mouse.get_pos()
 
     # ------------------------------------------------------- release lookup
 
@@ -382,7 +457,23 @@ class Installer:
     def _open_browser(self):
         start = self.path if os.path.isdir(self.path) else os.path.expanduser(
             "~")
-        self.browse = {"dir": os.path.abspath(start)}
+        self.browse = {"dir": None, "entries": [], "scroll": 0}
+        self._browse_go(os.path.abspath(start))
+
+    def _browse_go(self, path):
+        """Descend into a folder: the listing is read once per step (not per
+        frame) and the scroll resets to the top."""
+        self.browse["dir"] = path
+        self.browse["entries"] = self._browse_entries()
+        self.browse["scroll"] = 0
+
+    def _browse_max_scroll(self):
+        return max(0, len(self.browse["entries"]) - getattr(
+            self, "_b_rows_n", 1))
+
+    def _browse_scroll_by(self, rows):
+        self.browse["scroll"] = max(0, min(self._browse_max_scroll(),
+                                            self.browse["scroll"] + rows))
 
     def _browse_entries(self):
         try:
@@ -490,40 +581,97 @@ class Installer:
                 xp.TEXT_MUTED), (self.status_rect.x, self.status_rect.y))
 
     def _draw_browser(self):
-        w, h = WIN
-        box = pygame.Rect(w // 2 - 170, h // 2 - 110, 340, 220)
+        """The folder dialog: it grows with the window (a default frame
+        already shows a dozen entries) and a classic scrollbar takes over
+        when the folder holds more than fit."""
+        w, h = self.size
+        bw = min(max(w - 60, 340), 560)
+        bh = min(max(h - 60, 260), 480)
+        box = pygame.Rect((w - bw) // 2, (h - bh) // 2, bw, bh)
         body, _close = xp.message_frame(self.screen, box, "Choose a folder",
                                         self.font, icon=self.icon)
         self._b_close = _close
         xp.groupbox(self.screen, body.inflate(-6, -6), "", self.small)
+        # the buttons ride the dialog's bottom, the list fills between
+        self._b_up = pygame.Rect(body.x + 6, body.bottom - 30, 60, 24)
+        self._b_ok = pygame.Rect(body.right - 102, body.bottom - 30, 96, 24)
+        self._b_cancel = pygame.Rect(self._b_ok.x - 72, body.bottom - 30,
+                                     66, 24)
         head = pygame.Rect(body.x + 8, body.y + 6, body.width - 16, 18)
+        lst = pygame.Rect(body.x + 8, head.bottom + 4, body.width - 16,
+                          body.bottom - 38 - head.bottom - 8)
         self.screen.blit(self.small.render(
             self._tail(self.browse["dir"], head.width, self.small), True,
             xp.TEXT),
             (head.x, head.y))
-        lst = pygame.Rect(body.x + 8, head.bottom + 4, body.width - 16,
-                          body.height - 78)
         xp.field(self.screen, lst)
+        view = pygame.Rect(lst.x + 2, lst.y + 2, lst.width - 4, lst.height - 4)
+        row_h = 18
+        entries = self.browse["entries"]
+        total = len(entries)
+        self._b_rows_n = max(1, view.height // row_h)
+        self.browse["scroll"] = min(self.browse["scroll"],
+                                    self._browse_max_scroll())
+        scroll = self.browse["scroll"]
+        if total > self._b_rows_n:
+            track = pygame.Rect(view.right - 14, view.y, 14, view.height)
+        else:
+            track = pygame.Rect(view.right, view.y, 0, view.height)
+        self._b_track = track
         self._browse_rows = []
-        y = lst.y + 2
-        for name in self._browse_entries():
-            if y + 16 > lst.bottom:
+        for i in range(scroll, min(total, scroll + self._b_rows_n + 1)):
+            ry = view.y + (i - scroll) * row_h
+            if ry + row_h > view.bottom:
                 break
-            row = pygame.Rect(lst.x + 2, y, lst.width - 4, 16)
-            self._browse_rows.append((name, row))
-            self.screen.blit(self.font.render(name, True, xp.TEXT),
-                             (row.x + 4, y))
-            y += 16
+            row = pygame.Rect(view.x, ry, track.x - view.x - 6, row_h)
+            self._browse_rows.append((entries[i], row))
+            self._draw_folder(row.x + 3, row.centery)
+            self.screen.blit(self.font.render(
+                self._tail(entries[i], row.width - 24, self.font), True,
+                xp.TEXT), (row.x + 22, ry + 1))
+        thumb = None
+        if total > self._b_rows_n:
+            pygame.draw.rect(self.screen, (242, 240, 232), track)
+            pygame.draw.rect(self.screen, xp.SHADOW, track, 1)
+            th = max(24, int(track.height * self._b_rows_n / total))
+            span = max(1, track.height - th)
+            ty = track.y + int(span * scroll
+                               / max(1, self._browse_max_scroll()))
+            thumb = pygame.Rect(track.x + 1, ty, track.width - 2, th)
+            xp.gradient_v(self.screen, thumb, xp.BTN_TOP, xp.BTN_BOT)
+            pygame.draw.rect(self.screen, xp.BTN_BORDER, thumb, 1)
+            pygame.draw.line(self.screen, xp.SHADOW,
+                             (thumb.centerx - 2, thumb.centery),
+                             (thumb.centerx + 2, thumb.centery))
+            pygame.draw.line(self.screen, xp.HILITE,
+                             (thumb.centerx - 2, thumb.centery + 1),
+                             (thumb.centerx + 2, thumb.centery + 1))
+        self._b_thumb = thumb
         mx, my = pygame.mouse.get_pos()
-        self._b_up = pygame.Rect(lst.x, lst.bottom + 6, 60, 24)
-        self._b_ok = pygame.Rect(lst.right - 96, lst.bottom + 6, 96, 24)
-        self._b_cancel = pygame.Rect(lst.right - 168, lst.bottom + 6, 66, 24)
         xp.button(self.screen, self._b_up, "Up", self.font,
                   hovered=self._b_up.collidepoint(mx, my))
         xp.button(self.screen, self._b_ok, "Choose", self.font, default=True,
                   hovered=self._b_ok.collidepoint(mx, my))
         xp.button(self.screen, self._b_cancel, "Cancel", self.font,
                   hovered=self._b_cancel.collidepoint(mx, my))
+
+    def _draw_folder(self, x, cy):
+        """The little manila folder mark in front of every entry."""
+        r = pygame.Rect(x, cy - 4, 12, 9)
+        pygame.draw.rect(self.screen, (224, 180, 92), r)
+        pygame.draw.rect(self.screen, (160, 122, 58), r, 1)
+        pygame.draw.rect(self.screen, (224, 180, 92), (r.x + 1, r.y - 2, 5, 2))
+
+    def _sb_scroll_to(self, my):
+        """During a scrollbar drag the thumb follows the cursor: map its
+        travel range onto the row range."""
+        track, thumb = getattr(self, "_b_track", None), self._b_thumb
+        if not track or thumb is None:
+            return
+        span = max(1, track.height - thumb.height)
+        frac = (my - track.y - thumb.height // 2) / span
+        self.browse["scroll"] = int(round(max(0.0, min(1.0, frac))
+                                          * self._browse_max_scroll()))
 
     def _tail(self, text, width, font=None):
         """Right-align long paths by keeping the tail, trimming the front so
@@ -540,14 +688,21 @@ class Installer:
         if event.type == pygame.QUIT:
             self.running = False
             return
+        if event.type == pygame.VIDEORESIZE:
+            # the surface already changed; clamp only what we lay out, so
+            # a drag below the minimum keeps the widgets usable
+            self.size = (max(event.w, MIN_WIN[0]), max(event.h, MIN_WIN[1]))
+            self._layout()
+            return
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self._drag = None
             self._win_pending = None
+            self._b_sbdrag = False
         if self.browse is not None:
             self._handle_browse(event)
             return
         if event.type == pygame.MOUSEMOTION and self._drag:
-            self._drag_update()
+            self._drag_update(event.rel)
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if not self._drag_start(event.pos):
                 self._click(event.pos)
@@ -605,6 +760,13 @@ class Installer:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.browse = None
             return
+        if event.type == pygame.MOUSEWHEEL:
+            self._browse_scroll_by(-3 if event.y > 0 else 3)
+            return
+        if event.type == pygame.MOUSEMOTION:
+            if getattr(self, "_b_sbdrag", False):
+                self._sb_scroll_to(event.pos[1])
+            return
         if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
             return
         pos = event.pos
@@ -618,11 +780,21 @@ class Installer:
         elif self._b_up.collidepoint(pos):
             parent = os.path.dirname(self.browse["dir"])
             if parent and parent != self.browse["dir"]:
-                self.browse["dir"] = parent
+                self._browse_go(parent)
+        elif (getattr(self, "_b_thumb", None)
+                and self._b_thumb.collidepoint(pos)):
+            self._b_sbdrag = True          # grab the thumb where it lies
+        elif self._b_track.collidepoint(pos) and self._b_thumb:
+            # a click in the trough pages toward the click, and starts a
+            # drag so holding the button keeps scrolling
+            self._browse_scroll_by(-self._b_rows_n
+                                   if pos[1] < self._b_thumb.y
+                                   else self._b_rows_n)
+            self._b_sbdrag = True
         else:
             for name, row in getattr(self, "_browse_rows", []):
                 if row.collidepoint(pos):
-                    self.browse["dir"] = os.path.join(self.browse["dir"], name)
+                    self._browse_go(os.path.join(self.browse["dir"], name))
                     break
 
     def run(self):

@@ -19,7 +19,7 @@ from fligchess.ui import xp
 # The one place the app's version lives. Bump APP_VERSION by hand for a
 # release; the build workflow tags "fligchessV" + APP_VERSION, so repeated
 # pushes before a bump refresh the same release's assets.
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 TAG_PREFIX = "fligchessV"
 
 
@@ -88,7 +88,12 @@ TOKEN_FIELD_TIP = "GitHub token used by the updater; leave blank for public acce
 # state badge and per-row Download / Update / Delete buttons. These are the
 # fixed words it paints; the numbers and names come from bot_updater.check().
 BOT_BROWSER_TITLE = "Manage bots"
-BOT_HEADINGS = ("Bot", "Local", "Remote", "Status")
+# the browser's columns, left to right: the modes column tells which game
+# shapes each bot accepts ("2p", "4p", ...) straight off its MODES attribute
+BOT_HEADINGS = ("Bot", "Local", "Remote", "Modes", "Status")
+# where each heading and its column text sit, as a fraction of the panel
+BOT_COL_FRACS = (0.03, 0.30, 0.39, 0.48, 0.66)
+BOT_FORCE_MODES = "Force allow all modes"
 BOT_STATE_LABELS = {"current": "installed",
                     "update": "update available",
                     "new": "not installed",
@@ -102,6 +107,15 @@ BOT_BLOCKED_NOTE = "Update the app first"   # app-min-version gate text
 BOT_LOADING = "Contacting the repository..."
 BOT_EMPTY = "No bots are listed in the index."
 BOT_NONE_LOCAL = "No bots installed."
+# retired: a cross seat's engine dropdown no longer offers the built-in mover
+# (there is no mover in gameplay any more), but the label stays for diagnostics
+# and any legacy reference
+BOT_BUILTIN = "(built-in)"
+# shown when an AI seat cannot be backed by an installed engine that plays the
+# chosen mode: with no engine for the mode the game refuses to start
+NO_ENGINE_TITLE = "No engine for this mode"
+NO_ENGINE_MSG = ("No installed engine plays this mode. Install a bot or turn "
+                 "on 'Force allow all modes' in Manage bots.")
 
 
 def bot_app_blocked(app_min):
@@ -148,6 +162,10 @@ OPTIONS = {
     "cert_days": [90, 365, 825],
     "dev_mode": [True, False],
     "show_bot_dev": [True, False],
+    # the Manage bots checkbox: ignore every bot's MODES declaration and
+    # seat any engine anywhere (bots that truly cannot read the cross board
+    # simply play the first legal move there)
+    "allow_all_modes": [True, False],
 }
 
 # Chosen on the game setup screens rather than in the options list. Only the
@@ -179,6 +197,7 @@ DEFAULTS = {
     "cert_days": 825,
     "dev_mode": False,
     "show_bot_dev": False,
+    "allow_all_modes": False,
 }
 
 # Seconds a piece slide animation takes, per animation_speed setting.
@@ -321,6 +340,9 @@ LAN_ROW_PORT = "Port"
 # a cross game adds one row per army the host does not hold, naming who plays
 # that side: a built-in engine, a seat opened for browsers or one for apps
 LAN_ROW_SEAT = "%s plays"
+# a cross army set to Computer gets a second row naming the engine that should
+# play it; "(built-in)" keeps the app's own mover
+LAN_ROW_SEAT_BOT = "%s engine"
 LAN_SEAT_VALUES = ("ai", "web", "app")
 LAN_SEAT_LABELS = {"ai": "Computer", "web": "Web player", "app": "App player"}
 # the value each settings row shows on the right: a combo toggles between two

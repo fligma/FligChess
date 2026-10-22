@@ -2,12 +2,54 @@
   "repo": "fligma/FligChess",
   "bots": [
     {
-      "name": "fligbot",
-      "file": "fligbot.py",
+      "name": "fligbot blitz",
+      "file": "fligbot_blitz.py",
+      "version": 3,
+      "sha256": "sha256:83d561e04fd3418d96d1a2b18bf2056f23c3b2582ab46eaf980a7acea1473df2",
+      "size": 6990,
+      "app": "1.0.0",
+      "modes": [
+        "2p/*/classic",
+        "2p/*/minefield"
+      ]
+    },
+    {
+      "name": "fligbot classic",
+      "file": "fligbot_classic.py",
+      "version": 5,
+      "sha256": "sha256:7dc394d3d9ad5760b28b9a8d1411f3f5d437df77b18339fec46017d4b72fc8a9",
+      "size": 69322,
+      "app": "1.0.0",
+      "modes": [
+        "2p/*/classic",
+        "2p/*/minefield"
+      ]
+    },
+    {
+      "name": "fligbot classic 4p",
+      "file": "fligbot_classic_4p.py",
+      "version": 3,
+      "sha256": "sha256:d14f6a3bbe3887f7e171b3783ac4ff76c0e97e886c8ce46c098b65e3bfb4a6d6",
+      "size": 52869,
+      "app": "1.0.0",
+      "modes": [
+        "2p/*/classic",
+        "2p/*/minefield",
+        "4p/*/classic",
+        "4p/*/minefield"
+      ]
+    },
+    {
+      "name": "fligbot fog",
+      "file": "fligbot_fog.py",
       "version": 1,
-      "sha256": "sha256:f1fa564eacf9bf9a028bb5ec6cce0882d6e6e4e80417911be54bbd7d283aa9df",
-      "size": 58103,
-      "app": "1.0.0"
+      "sha256": "sha256:d840c6fd453ff2d004694da8855c64e1e619d5749831f295736ba88380d6ed5f",
+      "size": 7067,
+      "app": "1.0.0",
+      "modes": [
+        "2p/*/fog",
+        "4p/*/fog"
+      ]
     }
   ]
 }

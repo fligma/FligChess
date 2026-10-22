@@ -1,10 +1,13 @@
-"""fligbot - the bundled FligChess bot.
+"""fligbot classic - the bundled FligChess bot.
 
 It exposes no per-seat options and never weakens itself: every move is its
 single strongest search - iterative deepening within a fixed thinking budget
 (`FligBot.budget`, overridden by the app's --budget flag) to a deep ply cap,
-with full pruning, a tapered evaluation and an opening book. It always plays
-to win.
+with full pruning, a tapered evaluation and an opening book - and then two
+horizon audits that refuse a pick leaving a whole piece loose (`refine`) or
+hanging the very piece the move shifted (`blunder_pass`). It always plays
+to win, and it plays the two-player board: the four-army cross has its own
+engine in `fligbot_classic_4p.py`.
 """
 
 import pathlib
@@ -28,6 +31,16 @@ INF = 10 ** 9
 
 VAL = (0, 100, 320, 330, 500, 900, 20000)     # per piece id (P..K)
 NV = (0, 0, 3, 3, 5, 9, 0)                    # phase weight per piece id
+
+# the moved-piece safety pass (see `blunder_pass`): how much the opponent
+# must stand to win for a capture to count as a hang, how close to the pick
+# a safe rival has to be before it may replace it, and how many rivals are
+# re-checked, safest first
+HANG_MIN = 150                # above a pawn, so a free-pawn push is not a
+                              # blunder - gambits and breaks are normal chess
+EQUAL_CP = 30
+VERIFY_CAP = 8                # rivals given a fresh quiescence score
+VERIFIER_BUDGET = 0.5         # seconds the whole audit may take
 
 N_DELTAS = (33, 18, -14, -31, -33, -18, 14, 31)       # 0x88 offsets
 DIAG = (17, 15, -17, -15)
@@ -150,6 +163,30 @@ def _ep_key(sq):
 MOBILE = {N: (N_DELTAS, False)}
 MOBW = {N: 2}
 
+# evaluation terms the piece-square tables cannot express: a piece standing
+# where an enemy pawn can chase it, a slider with its exits being closed, a
+# king bolted into its own pawn cage and a pawn backed by its neighbour
+HARASS = 10
+TRAPPED = 45
+CAGE = 20
+SUPPORT = 5
+
+
+def _exits(b, sq, t, own):
+    """Squares a bishop or rook on sq may flee to - the first step in each
+    of its directions that is on the board and not blocked by its own side.
+    A pawn storm that takes these away boxes the piece in."""
+    dirs = DIAG if t == B else STRAIGHT
+    n = 0
+    for d in dirs:
+        a = sq + d
+        if a & 0x88:
+            continue
+        v = b[a]
+        if not v or (v & 8) != own:
+            n += 1
+    return n
+
 
 def _mobility(b, sq, own, dirs, ray):
     """Squares a piece on sq may influence (empty or enemy-occupied)."""
@@ -235,6 +272,20 @@ _BOOK_LINES = [
      "c7c6"],                                            # English vs Indian
     ["g1f3", "d7d5", "c2c4", "e7e6", "g2g3", "g8f6", "f1g2", "f8e7", "e1g1",
      "e8g8"],                                            # Reti
+    # more black defences and openings, so the search starts from a sound
+    # middlegame rather than an invented first move
+    ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3",
+     "g7g6", "f1e2", "f8g7", "e1g1", "e8g8"],           # Sicilian Dragon
+    ["e2e4", "d7d6", "d2d4", "g8f6", "b1c3", "g7g6", "g1f3", "f8g7", "f1e2",
+     "e8g8"],                                            # Pirc
+    ["e2e4", "c7c6", "d2d4", "d7d5", "e4e5", "c8f5", "g1f3", "e7e6", "f1e2",
+     "g8f6"],                                            # Caro-Kann Advance
+    ["e2e4", "e7e5", "f2f4", "e5f4", "g1f3", "d7d5", "e4d5", "g8f6", "f1e2",
+     "f6d5", "e1g1", "c7c5"],                           # King's Gambit
+    ["d2d4", "f7f5", "c2c4", "g8f6", "g2g3", "e7e6", "f1g2", "d7d5", "g1f3",
+     "f8e7", "e1g1", "e8g8"],                            # Dutch
+    ["d2d4", "g8f6", "g1f3", "d7d5", "c1f4", "e7e6", "e2e3", "f8d6", "f4d6",
+     "d8d6", "b1c3", "e8g8"],                            # London
 ]
 
 
@@ -462,6 +513,21 @@ class Engine:
         self.halfm = halfm
         self.npm[me] = npm_me
         self.npm[me ^ 1] = npm_en
+
+    # ------------------------------------------------------- state snapshots
+    # an abandoned search unwinds through frames that still have their move
+    # applied, so anything that can be interrupted restores from one of these
+
+    def snapshot(self):
+        return (self.b[:], self.side, tuple(self.kings), self.castle,
+                self.ep, self.halfm, tuple(self.npm), self.z)
+
+    def restore(self, snap):
+        (self.b, self.side, kings, self.castle, self.ep, self.halfm,
+         npm, self.z) = snap
+        self.kings = list(kings)
+        self.npm = list(npm)
+        self.reps = {self.z: 1}
 
     # ------------------------------------------------------------ attacks
 
@@ -839,6 +905,87 @@ class Engine:
         ranked.sort()
         return ranked[0][2] if ranked[0][0] < loss else best
 
+    # ------------------------------------------------- moved-piece safety
+    # `refine` audits the whole board once the move is on it. This pass asks
+    # the single question it cannot: can the piece the move *displaced* be
+    # taken right now? That is the difference between "something is loose"
+    # and "I planted my rook on a square every pawn can eat".
+
+    def hanging(self, m):
+        """Material the opponent wins by capturing the piece `m` has just
+        put on its destination square; 0 when nothing can take it there.
+        SEE scores the whole exchange, so a recapture behind the first grab
+        is already folded in, and kings are exempt - they are never taken.
+        Called with `m` already made, so the replies are the opponent's."""
+        to = (m >> 8) & 255
+        piece = self.b[to]
+        if not piece or (piece & 7) == K:
+            return 0
+        worst = 0
+        for r in self.gen(caps=True):
+            if ((r >> 8) & 255) != to:
+                continue
+            gain = self.see(r)
+            if gain > worst:
+                worst = gain
+        return worst
+
+    def probe(self, m):
+        """A fresh wide-window score for one root move: play it and let the
+        quiescence search settle every answer that captures anything. Root
+        scores out of the iteration are aspiration bounds - an upper bound
+        for every move that failed low - so a rival has to be re-scored
+        before it may replace the pick, which is exactly the mistake an
+        earlier version of this pass made by ranking on those bounds."""
+        u = self.make(m)
+        try:
+            return -self.qsearch(-INF, INF, 1)
+        finally:
+            self.unmake(m, u)
+
+    def blunder_pass(self, legal, scores, best, best_score):
+        """Trade the pick in for a rival that keeps its own piece safe, when
+        a re-search calls the two of them equal. Deliberately narrow: the
+        swap may cost at most `EQUAL_CP`, a pick that gives check is left
+        alone - a sacrifice is meant to hang its piece - and mate lines are
+        never touched."""
+        if best is None or abs(best_score) >= MATE_THRESHOLD:
+            return best
+        u = self.make(best)
+        checking = self.attacked(self.kings[self.side], self.side ^ 1)
+        threat = self.hanging(best)
+        self.unmake(best, u)
+        if threat < HANG_MIN or checking:       # it holds its ground
+            return best
+        rivals = []
+        for m in legal:
+            # a bound well under the pick's score is proof the move is worse;
+            # a bound near it is not proof of anything, which is why the
+            # survivors below are re-searched rather than trusted
+            if m == best or scores.get(m, -INF) < best_score - 150:
+                continue
+            u = self.make(m)
+            t2 = self.hanging(m)
+            self.unmake(m, u)
+            if t2 < threat:
+                rivals.append((t2, -scores.get(m, -INF), m))
+        if not rivals:
+            return best
+        rivals.sort()
+        snap = self.snapshot()
+        saved, self.deadline = (self.deadline,
+                                time.perf_counter() + VERIFIER_BUDGET)
+        try:
+            base = self.probe(best)
+            for _t2, _neg, m in rivals[:VERIFY_CAP]:
+                if self.probe(m) >= base - EQUAL_CP:
+                    return m                  # safest rival still worth the move
+        except TimeoutError:
+            self.restore(snap)
+        finally:
+            self.deadline = saved
+        return best
+
     # -------------------------------------------------------- evaluation
 
     def evaluate(self):
@@ -847,6 +994,7 @@ class Engine:
         phase = 0
         pawn_files = ([[] for _ in range(8)], [[] for _ in range(8)])
         bishops = [0, 0]
+        heavy = [0, 0]
         nonpawns = [0, 0]
         seventh = [0, 0]
         rook_file = [[], []]
@@ -871,6 +1019,7 @@ class Engine:
                 bish_color[c].append((f + r) & 1)
             elif t in (R, Q):
                 rook_file[c].append(f)
+                heavy[c] += 1
                 if r == (6 if white else 1):
                     seventh[c] += 1
             if t not in (P, K):
@@ -914,6 +1063,38 @@ class Engine:
                         else:
                             mg -= 15
                             pg -= 6
+            if t in (N, B, R, Q):
+                # a piece in the teeth of enemy pawns with no pawn of our own
+                # behind it is chased at a tempo; two of them, with its exits
+                # shutting, is not annoyance any more - it is being trapped.
+                # Attacking and defending pawns stand on the very same two
+                # squares either side of it, so one pass scores both
+                pw = 8 * c
+                ds = (-15, -17) if white else (15, 17)
+                hits = backs = 0
+                for d in ds:
+                    a = sq + d
+                    if a & 0x88:
+                        continue
+                    q = b[a]
+                    if q == 1 + pw:
+                        backs += 1
+                    elif q == 9 - pw:
+                        hits += 1
+                if hits and not backs:
+                    if white:
+                        mg -= HARASS
+                        pg -= HARASS // 2
+                    else:
+                        mg += HARASS
+                        pg += HARASS // 2
+                    if t in (B, R) and hits > 1 and _exits(b, sq, t, pw) <= 1:
+                        if white:
+                            mg -= TRAPPED
+                            pg -= TRAPPED // 2
+                        else:
+                            mg += TRAPPED
+                            pg += TRAPPED // 2
         if phase > 24:
             phase = 24
         if bishops[0] >= 2:
@@ -950,6 +1131,13 @@ class Engine:
                 adj = [g for g in (f - 1, f + 1) if 0 <= g < 8]
                 neigh = [x for g in adj for x in own[g]]
                 for r in ranks:
+                    # a pawn backed by a neighbour is a chain rung: taking it
+                    # costs the attacker a pawn on the spot, so the whole
+                    # structure stands on these pairs
+                    if any((r - 1 if c == 0 else r + 1) in own[g]
+                           for g in adj):
+                        mg += sign * SUPPORT
+                        pg += sign * SUPPORT // 2
                     passed = True
                     for g in (f - 1, f, f + 1):
                         if 0 <= g < 8:
@@ -1004,6 +1192,28 @@ class Engine:
                         front2 = kr + 2 if c == 0 else kr - 2
                         if not (0 <= front2 < 8 and front2 in pawn_files[c][g]):
                             mg -= sign * 5
+
+        # back-rank cage: a king on its home rank behind all three front
+        # pawns, with an enemy rook or queen still on the board, is one
+        # deflection from mate - far past the search horizon, so price it
+        if phase > 8:
+            for c in (0, 1):
+                sign = 1 if c == 0 else -1
+                home = 0 if c == 0 else 7
+                ksq = self.kings[c]
+                if (ksq >> 4) != home or not heavy[1 - c]:
+                    continue
+                kf = ksq & 7
+                front = home + 1 if c == 0 else home - 1
+                cage = True
+                for g in (kf - 1, kf, kf + 1):
+                    if not 0 <= g < 8:
+                        continue
+                    if front not in pawn_files[c][g]:
+                        cage = False
+                        break
+                if cage:
+                    mg -= sign * CAGE
 
         # king attack zone (middlegame only): every one of our pieces bearing
         # on the squares around the enemy king is mating pressure, and the
@@ -1283,7 +1493,11 @@ class Engine:
             u = self.make(m)
             self.pv[ply + 1] = m
             if i >= 4 and depth >= 3 and quiet and not in_check:
-                sc = -self.negamax(depth - 2, -beta, -alpha, ply + 1)
+                # the deeper into the ordering a quiet move sits, the less it
+                # deserves a full look; the re-search below still catches any
+                # reduction that was too bold
+                red = 3 if i >= 10 else 2
+                sc = -self.negamax(depth - red, -beta, -alpha, ply + 1)
                 if sc > alpha:            # reduction may have been too bold
                     sc = -self.negamax(depth - 1, -beta, -alpha, ply + 1)
             else:
@@ -1346,8 +1560,7 @@ class Engine:
         # a mid-iteration timeout unwinds through root_pass with moves
         # still applied, so the board would be several plies deep when we
         # return; snapshot the root position and restore it on the way out
-        snap = (self.b[:], self.side, tuple(self.kings), self.castle,
-                self.ep, self.halfm, tuple(self.npm), self.z)
+        snap = self.snapshot()
         try:
             self.root_scores = {}
             for depth in range(1, maxdepth + 1):
@@ -1360,19 +1573,22 @@ class Engine:
                     root_moves.sort(reverse=True)
                 else:
                     root_moves = self.order(legal, prev, 0)
-                if (depth >= 7 and best_score > -INF
+                if (depth >= 6 and best_score > -INF
                         and abs(best_score) < MATE_THRESHOLD):
-                    # aspiration pays off only at high depth: at shallow
+                    # aspiration pays off only at real depth: at shallow
                     # depths a mispredict wastes a whole re-search and the
-                    # tiny budget cannot spare it
-                    lo, hi = best_score - 26, best_score + 26
-                    for attempt in range(3):
+                    # tiny budget cannot spare it. the window is widened
+                    # graduated rather than once and for all, because a
+                    # single +80 step kept landing inside the same failing
+                    # window and threw the depth away on a re-search
+                    lo, hi = best_score - 30, best_score + 30
+                    for attempt in range(4):
                         chosen, score = self.root_pass(root_moves, depth,
                                                        lo, hi)
                         if chosen is None or score <= lo:
-                            lo = -INF if attempt else lo - 80
+                            lo = -INF if attempt == 3 else lo - 100 * (attempt + 1)
                         elif score >= hi:
-                            hi = INF if attempt else hi + 80
+                            hi = INF if attempt == 3 else hi + 100 * (attempt + 1)
                         else:
                             break
                     else:
@@ -1383,8 +1599,6 @@ class Engine:
                                                    -INF, INF)
                 if chosen is None:
                     break                      # aspiration never confirmed
-                if time.perf_counter() > self.deadline and depth > 1:
-                    break                      # ignore the unfinished round
                 # unstable bound: this iteration flipped the best move, so
                 # the old "best" was a cutoff mirage - double the budget
                 # (hard cap 20s) up to twice to settle the verdict
@@ -1398,14 +1612,15 @@ class Engine:
                 self.last_depth = depth
                 if score >= MATE_THRESHOLD:
                     break
+                # the clock may have run during this round; it finished, so
+                # its verdict is the strongest thing we have and is kept -
+                # only the next round is skipped
+                if time.perf_counter() > self.deadline:
+                    break
                 if len(self.tt) > 300_000:
                     self.tt.clear()
         except TimeoutError:
-            (self.b, self.side, kings, self.castle, self.ep, self.halfm,
-             npm, self.z) = snap
-            self.kings = list(kings)
-            self.npm = list(npm)
-            self.reps = {self.z: 1}
+            self.restore(snap)
         return best, best_score
 
     def root_pass(self, root_moves, depth, alpha, beta):
@@ -1430,13 +1645,14 @@ class Engine:
 
 
 class FligBot(Bot):
-    name = "fligbot"
+    name = "fligbot classic"
     author = "fligchess"
-    version = 2
+    version = 5                 # v5: modes narrowed to classic + minefield
     CONFIG = {}                 # no per-seat options: it always plays to win
+    MODES = ("2p/*/classic", "2p/*/minefield")   # the plain two-army board
 
-    budget = 2.0                # seconds per move; the app's --budget overrides
-    MAX_SEARCH_DEPTH = 40       # iterative deepening is really cut off by time
+    budget = 3.0                # seconds per move; the app's --budget overrides
+    MAX_SEARCH_DEPTH = 48       # iterative deepening is really cut off by time
 
     def __init__(self):
         super().__init__()
@@ -1450,8 +1666,9 @@ class FligBot(Bot):
     def choose(self, position):
         """Its single strongest move: an opening-book line when one matches,
         otherwise iterative deepening within `self.budget` seconds, followed
-        by the horizon-blind safety audit that refuses to leave a piece
-        en prise. Never weakens itself."""
+        by the two horizon audits - the loose-material `refine` and the
+        moved-piece `blunder_pass`. Neither invents a plan; they only refuse
+        a pick the shallow search walked into, so tactics always win."""
         moves = position.legal_moves()
         if not moves:
             return None
@@ -1465,13 +1682,15 @@ class FligBot(Bot):
 
         eng = self._engine
         eng.load(position.fen())
+        legal = eng.gen_legal()
         m, score = eng.search(self.budget, self.MAX_SEARCH_DEPTH)
         if m is None:
             return random.choice(moves)
         # horizon-blind safety audit: the filter only reshuffles between
         # moves the search already rated near-equal, so tactics the engine
         # genuinely found always win
-        m = eng.refine(eng.gen_legal(), eng.root_scores, m, score) or m
+        m = eng.refine(legal, eng.root_scores, m, score) or m
+        m = eng.blunder_pass(legal, eng.root_scores, m, score) or m
         frm = m & 255
         to = (m >> 8) & 255
         promo = {5: "q", 4: "r", 3: "b", 2: "n"}.get((m >> 16) & 7)
@@ -1480,7 +1699,7 @@ class FligBot(Bot):
 
 
 if __name__ == "__main__":
-    # tiny self-test: python bots/fligbot.py
+    # tiny self-test: python bots/fligbot_classic.py
     eng = Engine()
     for label, fen, counts in (
             ("startpos", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -1494,4 +1713,24 @@ if __name__ == "__main__":
     bot = FligBot()
     bot.configure({})
     pos = Position(fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-    print("fligbot picks:", bot.choose(pos))
+    print(f"{bot.name} picks:", bot.choose(pos))
+    # the moved-piece audit: a queen marched onto a square the d5 pawn
+    # attacks, in an otherwise empty board, must be talked off it
+    eng.load("3k4/8/8/3p4/8/8/8/Q3K3 w - - 0 1")
+    legal = eng.gen_legal()
+    pull = pack(0, 52)                          # Qa1-e4, straight onto a pawn
+    keep = eng.blunder_pass(legal, {m: 0 for m in legal}, pull, 0)
+    print("blunder guard keeps the queen off e4:", keep != pull)
+    # the opening book: every advertised line must be legal end-to-end, so a
+    # mistyped token surfaces here instead of silently truncating its line
+    truncated = []
+    for line in _BOOK_LINES:
+        p = Position(fen=_BOOK_START)
+        for tok in line:
+            mv = _book_move(tok)
+            if mv not in p.legal_moves():
+                truncated.append(" ".join(line) + " @ " + tok)
+                break
+            p = p.make(mv)
+    print(f"opening book: {len(_BOOK_LINES)} lines,",
+          "all legal" if not truncated else f"TRUNCATED {truncated}")

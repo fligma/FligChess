@@ -100,7 +100,10 @@ jobs:
           SDL_VIDEODRIVER: dummy
         run: |
           pip install pygame
-          python bots/fligbot.py
+          for bot in bots/fligbot_classic.py bots/fligbot_classic_4p.py bots/fligbot_blitz.py; do
+            echo "== $bot =="
+            python "$bot"
+          done
       - name: Bump versions of changed bots
         run: |
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then

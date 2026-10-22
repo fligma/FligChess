@@ -13,6 +13,7 @@ binary in and starts the new one - the trick that lets an app replace its
 own running executable.
 """
 
+import ctypes
 import os
 import platform
 import subprocess
@@ -120,6 +121,16 @@ def shutil_rmtree(path):
 
 def _desktop_path():
     if os.name == "nt":
+        # ask the shell where the Desktop really is: with OneDrive
+        # redirection the folder under %USERPROFILE%\Desktop is a decoy (or
+        # missing) and a shortcut written there never shows up
+        try:
+            buf = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(
+                    None, 0, None, 0, buf) == 0 and buf.value:
+                return Path(buf.value)
+        except (OSError, AttributeError):
+            pass
         base = os.environ.get("USERPROFILE") or str(Path.home())
         return Path(base) / "Desktop"
     try:
@@ -152,13 +163,17 @@ def _windows_shortcut(exe, icon):
     desk = _desktop_path()
     lnk = desk / "FligChess.lnk"
     icon = icon or str(exe.parent / "logo.ico")
+    if not os.path.isfile(icon):
+        icon = str(exe)          # the embedded exe icon beats no icon at all
     install_dir = str(exe.parent)
+    # ",0" names the first icon image explicitly: some shells read a bare
+    # path as an invalid location and leave the shortcut without one
     script = f'''
 $ws = New-Object -ComObject WScript.Shell
 $s = $ws.CreateShortcut("{lnk}")
 $s.TargetPath = "{exe}"
 $s.WorkingDirectory = "{install_dir}"
-$s.IconLocation = "{icon}"
+$s.IconLocation = "{icon},0"
 $s.Description = "FligChess"
 $s.Save()
 '''.strip()

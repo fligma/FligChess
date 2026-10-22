@@ -53,6 +53,20 @@ class Variant:
         """Squares `viewer` (default: the side to move) may not see."""
         return frozenset()
 
+    def visibility(self, board, viewers=None):
+        """(hidden, owners) for a whole-board union view.
+
+        `hidden` is every playable square no viewer can see; `owners` maps
+        each shown square to the frozenset of viewers that can see it. Used
+        for spectators and AI duels, where nobody holds a single side but the
+        fog must still veil the tiles every army is blind to. Classic hides
+        nothing."""
+        return frozenset(), {}
+
+    def blinded(self, board, viewer):
+        """A clone of `board` with what `viewer` may not see blanked out."""
+        return board.clone()
+
     def bot_view(self, board):
         """The position a bot is allowed to think about."""
         return board.clone()
@@ -126,18 +140,70 @@ class FogOfWar(Variant):
                 hidden.discard(king)
         return frozenset(hidden)
 
-    def bot_view(self, board):
+    def _cells(self, board):
+        """Every playable square on whichever board shape (the cross corners
+        cut out; the classic 8x8 whole)."""
+        if _is_cross(board):
+            return [(x, y) for y in range(14) for x in range(14)
+                    if _playable4((x, y))]
+        return [(f, r) for r in range(8) for f in range(8)]
+
+    def _viewers(self, board):
+        """The sides whose eyes count for a union view: the standing armies on
+        the cross, the two colours on the classic board."""
+        if _is_cross(board):
+            out = getattr(board, "out", ())
+            return tuple(a for a in ("w", "b", "r", "bl") if a not in out)
+        return (WHITE, BLACK)
+
+    def visibility(self, board, viewers=None):
+        """The union of every viewer's sight: a square is fogged only when no
+        army can see it, and each shown square names the armies that can. The
+        kings-always-visible and off-board rules of `hidden` carry straight
+        over, so a spectator is blind only where every player is blind."""
+        if viewers is None:
+            viewers = self._viewers(board)
+        cells = self._cells(board)
+        owners = {sq: [] for sq in cells}
+        for v in viewers:
+            seen = set(cells) - set(self.hidden(board, v))
+            for sq in seen:
+                owners[sq].append(v)
+        shown, hidden = {}, set()
+        for sq, o in owners.items():
+            if o:
+                shown[sq] = frozenset(o)
+            else:
+                hidden.add(sq)
+        return frozenset(hidden), shown
+
+    def blinded(self, board, viewer):
+        """The board as one viewer is allowed to see it: a clone with every
+        hidden square's enemy piece blanked (own pieces always stay)."""
         view = board.clone()
         cross = _is_cross(board)
-        turn = board.turn
-        for sq in self.hidden(board):
+        for sq in self.hidden(board, viewer):
             piece = view.get(sq)
             if piece is None:
                 continue
             owner = _army_of(piece) if cross else color_of(piece)
-            if owner != turn:
+            if owner != viewer:
                 view.set(sq, None)          # unseen enemies are not there
         return view
+
+    def blinded_union(self, board):
+        """The board as no single player holds it: a clone blanked only where
+        nobody at all can see, the view a spectator or duel onlooker is shown.
+        """
+        view = board.clone()
+        hidden, _owners = self.visibility(board)
+        for sq in hidden:
+            if view.get(sq) is not None:
+                view.set(sq, None)
+        return view
+
+    def bot_view(self, board):
+        return self.blinded(board, board.turn)
 
 
 def _is_king(board, piece):

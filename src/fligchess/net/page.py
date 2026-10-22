@@ -485,6 +485,31 @@ function nextPly() {
 function jumpLive() { viewPly = null; render(); }
 function sqName(c, r) { return String.fromCharCode(97 + c) + (r + 1); }
 
+// The union view a spectator is shown tints each visible tile by the armies
+// that can see it, reusing the same hues as the app's ARMY_TINT so an onlooker
+// reads "who sees what" the same way as on the desktop. A lone owner paints
+// that team's hue; several blend toward an average, exactly as _blend_tint.
+var ARMY_TINT = {w: [240, 240, 240], b: [40, 40, 40],
+                 r: [200, 60, 50], bl: [60, 110, 200]};
+// the plain checker colours (match .sq.light / .sq.dark above), blended with
+var TINT_BASE = {light: [238, 242, 251], dark: [148, 179, 230]};
+function armyRgb(owners) {
+  var cols = (owners || []).map(function (o) {
+    return ARMY_TINT[o] || [128, 128, 128];
+  });
+  if (!cols.length) cols = [[128, 128, 128]];
+  var n = cols.length, s = [0, 0, 0];
+  for (var j = 0; j < n; j++)
+    for (var i = 0; i < 3; i++) s[i] += cols[j][i];
+  return [Math.round(s[0] / n), Math.round(s[1] / n), Math.round(s[2] / n)];
+}
+function tintedBackground(rgb, lightOn) {
+  var base = TINT_BASE[lightOn ? "light" : "dark"], a = 0.42, out = [];
+  for (var i = 0; i < 3; i++)
+    out.push(Math.round(base[i] * (1 - a) + rgb[i] * a));
+  return "rgb(" + out.join(",") + ")";
+}
+
 function render() {
   if (!state) return;
   var board = document.getElementById("board");
@@ -503,7 +528,20 @@ function render() {
   // no clicking while reviewing, and only the seated player ever gets hints:
   // a spectator is read-only, the server already refuses their moves
   var dests = (state.role !== "guest" || review) ? {} : (state.dests || {});
-  var fog = state.fog || [];
+  // the fog to veil and the tint to paint depend on who is looking and whether
+  // they are scrubbing back: a seated player sees only its own fog (the server
+  // already blanked every hidden piece), a spectator the union fog plus the
+  // per-tile team tint, and a review ply keeps the fog captured under it
+  var fog, tint = {};
+  if (review) {
+    fog = (snap && snap.fog) || [];
+    tint = (snap && snap.tint) || {};
+  } else if (viewer) {
+    fog = state.spec_fog || [];
+    tint = state.tint || {};
+  } else {
+    fog = state.fog || [];
+  }
   // the grid of piece codes: for the cross, cells[y][x] with y 0 the north
   // edge; for the two-player board, rows[r] are eight strings with r 0 the
   // top rank (rank 8). Empty cells are '.'; the cross marks its four cut-out
@@ -536,7 +574,12 @@ function render() {
         lightOn = ((bc + (7 - br)) % 2) === 1;
       }
       cell.className = "sq " + (lightOn ? "light" : "dark");
-      if (fog.indexOf(name) >= 0) cell.classList.add("fog");
+      if (fog.indexOf(name) >= 0) {
+        cell.classList.add("fog");      // a defense-in-depth veil: the piece
+      } else if (tint[name]) {          // is already blanked on the server
+        cell.style.background =
+            tintedBackground(armyRgb(tint[name]), lightOn);
+      }
       if (piece && piece !== ".") {
         var s = document.createElement("span");
         s.className = "p";

@@ -68,6 +68,8 @@ def api_lines():
     lines += ["", "=" * _WIDTH, ""]
     lines += _class_lines(bot_api.Position, "class Position")
     lines += ["", "=" * _WIDTH, ""]
+    lines += _class_lines(bot_api.GameInfo, "class GameInfo")
+    lines += ["", "=" * _WIDTH, ""]
     lines += _class_lines(bot_api.Bot, "class Bot")
     lines += ["", "load_bots(directory)"]
     lines += ["      " + ln for ln in _doc(bot_api.load_bots)]

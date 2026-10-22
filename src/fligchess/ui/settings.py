@@ -4,8 +4,8 @@ The Settings page only carries how the program looks and sounds; who plays
 which side is decided before a game starts, on the setup screens, and lives
 under "players" - one seat per colour.
 
-    {"w": {"type": "human", "bot": None,      "name": "", "config": {}},
-     "b": {"type": "ai",    "bot": "fligbot", "name": "", "config": {...}}}
+    {"w": {"type": "human", "bot": None,            "name": "", "config": {}},
+     "b": {"type": "ai",    "bot": "fligbot classic", "name": "", "config": {...}}}
 
 `config` holds one bot's own CONFIG values, so two seats on the same engine
 can play it at different difficulties. Each bot's last used values are also

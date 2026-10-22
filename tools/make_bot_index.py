@@ -8,7 +8,7 @@ Version numbers live in `bots/<file>.meta.json` (written by the CI when a
 bot changes; see .github/workflows/build.yml). A brand-new bot with no
 meta file is registered at version 1.
 
-Usage:  python tools/make_bot_index.py [--bump fligbot.py]
+Usage:  python tools/make_bot_index.py [--bump fligbot_classic.py]
 """
 
 import argparse
@@ -51,6 +51,24 @@ def bot_name(path):
     raise SystemExit(f"{path.name}: no Bot subclass with a name found")
 
 
+def bot_modes(path):
+    """The game shapes a bot accepts, read off its MODES class attribute.
+
+    Shipped bots report this from the loaded class anyway; carrying it in the
+    index too lets the browser label a remote bot the app has not downloaded
+    yet. Empty when the file predates MODES."""
+    sys.path.insert(0, str(ROOT / "src"))
+    from fligchess.core.bot_api import Bot
+    spec = importlib.util.spec_from_file_location("idx_bot_modes", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for obj in vars(module).values():
+        if (isinstance(obj, type) and issubclass(obj, Bot)
+                and obj is not Bot and getattr(obj, "name", None)):
+            return list(getattr(obj, "MODES", ()) or ())
+    return []
+
+
 def meta_path(path):
     return BOTS / (path.stem + ".meta.json")
 
@@ -90,6 +108,7 @@ def main():
             "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
             "size": len(raw),
             "app": app,                     # minimum app version that runs it
+            "modes": bot_modes(path),       # game shapes the bot plays
         })
 
     index = {"repo": "fligma/FligChess", "bots": entries}

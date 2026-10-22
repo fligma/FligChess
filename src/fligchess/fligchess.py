@@ -29,15 +29,14 @@ try:                      # real window tricks: borderless, move, resize
 except ImportError:
     _sdl2 = None
 
-from fligchess.core import (ChessGame, Move, WHITE, BLACK, san,
-                            Position, Board, load_bots, variants,
-                            WHITE_WINS, BLACK_WINS, DRAW)
+from fligchess.core import (ChessGame, Move, Board, WHITE, BLACK, san,
+                            Position, GameInfo, bot_allows, load_bots,
+                            variants, WHITE_WINS, BLACK_WINS, DRAW)
 from fligchess.core import bot_updater
 from fligchess.core import selfupdate
 from fligchess.core import bot_docs
-from fligchess.core.game import Game4, ARMY_NAMES
+from fligchess.core.game import Game4, ARMY_NAMES, _sig4, DRAW4
 from fligchess.core import board4 as _board4
-from fligchess.core import mover4 as _mover4
 from fligchess.core.san4 import san4 as _san4
 from fligchess.core.board4 import (ARMIES as _ARMY_IDS, WHITE as _A_WHITE,
                                    BLACK as _A_BLACK, RED as _A_RED,
@@ -119,6 +118,17 @@ def _load_sdl_dll():
 def ease_out(t):
     """Smooth 0->1 curve for piece slides."""
     return t * t * (3 - 2 * t)
+
+
+def _blend_tint(owners, alpha=64):
+    """The RGBA a union view paints on a tile every listed army can see: the
+    average of their tints, so a lone owner shows that team's hue and several
+    blend toward a shared one. An unknown owner reads as neutral grey."""
+    cols = [const.ARMY_TINT.get(o, (128, 128, 128)) for o in owners] \
+        or [(128, 128, 128)]
+    n = len(cols)
+    return (sum(c[0] for c in cols) // n, sum(c[1] for c in cols) // n,
+            sum(c[2] for c in cols) // n, alpha)
 
 
 def _parse_square(name):
@@ -203,11 +213,27 @@ def _qr_scale(window_w, window_h):
     return max(3, min(8, (min(window_w, window_h) - 150) // 33))
 
 
+def _set_win_app_id():
+    """Claim our own Windows taskbar button. Without an explicit
+    AppUserModelID the shell groups the window under whatever launched it
+    and paints the generic pygame feather in the taskbar; with one, the
+    icon set by pygame.display.set_icon is the icon the taskbar shows.
+    Windows only, and never fatal."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Fligma.FligChess")
+    except (OSError, AttributeError):
+        pass
+
+
 # ------------------------------------------------------------------ the app
 
 
 class ChessApp:
     def __init__(self, args=None):
+        _set_win_app_id()             # before the window exists: taskbar icon
         pygame.init()
         pygame.display.set_caption("FligChess")
         self._set_os_icon()
@@ -280,10 +306,11 @@ class ChessApp:
         # {"color", "kind"} for a cross game, None for the lone shared seat
         # of a two-player game (or a game with no human seats at all)
         self.host_seats = None
-        self._ai_t = 0.0               # built-in mover think timer
+        self._ai_t = 0.0               # cross-seat random-fill think timer
         self._cross_surface = None     # cached cross checkerboard
         self.variant = variants.create(self.settings["variant"])
         self._fog = frozenset()        # squares the current viewer can't see
+        self._tint = {}                # union view: shown square -> seeing armies
         self._viewer = None            # whose eyes the screen shows
         # ---- web hosting: live only while a hosted game is up
         self.hosting = False           # are we the host of a running game?
@@ -303,7 +330,8 @@ class ChessApp:
         self.offline_players = 2       # armies an offline game was set for
         # the four cross seats an offline game edits, kept apart from the two
         # colour seats above so the two-player page is untouched; each is
-        # {"type": HUMAN/AI, "name": str} (a cross AI is the built-in mover)
+        # {"type": HUMAN/AI, "name": str} (a cross AI names a gate-allowed
+        # engine)
         self.offline_seats = self._default_offline_seats()
         self._qr_surface = None        # cached QR bitmap
         self._qr_url = None            # the url the cached bitmap is for
@@ -335,6 +363,7 @@ class ChessApp:
         self.white_bot = None          # a second bot here means AI vs AI
         self.bot_color = BLACK         # the black bot always plays black
         self._think = None             # {"t", "box"} while a bot computes
+        self._think4 = None            # the same, for a cross army's engine
         self.think_delay = BOT_THINK_DELAY
         self.open_menu = None          # index of the dropped-down menu bar item
         self.show_about = False
@@ -410,9 +439,11 @@ class ChessApp:
 
     def _set_os_icon(self):
         """Give the window the FligChess logo as its taskbar / alt-tab /
-        caption icon, instead of the default pygame feather. Called before
-        the mode is set so the icon is in place the moment the window
-        appears; a missing or unreadable asset never blocks startup."""
+        caption icon, instead of the default pygame feather. Paired with
+        _set_win_app_id, which is what actually pins this icon to the
+        taskbar on Windows. Called before the mode is set so the icon is
+        in place the moment the window appears; a missing or unreadable
+        asset never blocks startup."""
         try:
             icon = pygame.image.load(ASSETS_DIR / "logo.png").convert_alpha()
             pygame.display.set_icon(icon)
@@ -635,7 +666,43 @@ class ChessApp:
             self.screen = self._set_mode()
         self._layout()
         if getattr(a, "autoplay", False):
-            self.start_game()
+            if getattr(a, "players", 2) == 4:
+                # every cross army is engine-driven by an engine that plays
+                # this variant; with no lone human nobody is hidden, so the
+                # duel is shown as a union view
+                self.offline_players = 4
+                self.variant = variants.create(self.settings["variant"],
+                                               four=True)
+                seats = self._cross_autoplay_seats()
+                if any(not s.get("bot") for s in seats.values()):
+                    # a duel seat with no allowed engine: refuse to run
+                    self.message = (const.NO_ENGINE_TITLE, const.NO_ENGINE_MSG)
+                    return
+                self.start_game4(seats, viewer=None)
+            else:
+                self.start_game()
+
+    def _cross_autoplay_seats(self):
+        """The four cross seats for `--autoplay --players 4`: each named
+        engine sits its own army, and `--white` names every army not given an
+        engine of its own. An army whose name is blank, uninstalled, or will
+        not play this mode falls back to the default engine for the mode - and
+        to nothing where no engine plays it, so the caller refuses to start."""
+        a = self.args
+        mode = self._mode_token(4)
+        named = {"w": getattr(a, "white", None), "b": getattr(a, "black", None),
+                 "r": getattr(a, "red", None), "bl": getattr(a, "blue", None)}
+        seats = {}
+        for army in _ARMY_IDS:
+            name = named.get(army) or getattr(a, "white", None)
+            if name not in self.bots or not self._bot_allows(name, mode):
+                name = self._default_engine(mode)
+            # name the seat by its engine when one is seated, so the live
+            # report says who plays each army and a tournament can score a
+            # win by engine; an army with no engine keeps its colour word
+            seats[army] = {"type": AI, "bot": name,
+                           "name": name or const.ARMY_LABELS[army]}
+        return seats
 
     def toggle_maximize(self):
         win = self._sdlwin()
@@ -922,6 +989,7 @@ class ChessApp:
         self._win_pending = None
         self._applied_pos = self._applied_size = None
         self._refresh_fog()
+        self._review[0]["fog"], self._review[0]["tint"] = self._view_fog_tint()
         self.state = GAME
 
     def _play(self, move):
@@ -954,9 +1022,11 @@ class ChessApp:
                              "check": notation.endswith(("+", "#"))})
         self.follow_latest = True
         # record this position for the move scrubber and jump back to live
+        fog, tint = self._view_fog_tint()
         self._review.append({"rows": self._rows_snapshot(),
                              "last": [sq_name(move.from_sq),
-                                      sq_name(move.to_sq)]})
+                                      sq_name(move.to_sq)],
+                             "fog": fog, "tint": tint})
         self.view_ply = None
         self.last_move = move
         self.selected = None
@@ -1037,28 +1107,33 @@ class ChessApp:
     # A dedicated driver for the cross board. It owns its own seats (self.seats4,
     # keyed by army id), its own move/click/update path and its own renderer, so
     # the two-player ChessGame path above is never reached while self.four is on.
-    # Armies whose seat is AI move through the built-in mover; a HUMAN seat moves
-    # on clicks; a REMOTE seat (a hosted guest) moves on the server's queue.
+    # Armies whose seat is AI move on their gate-allowed engine; a HUMAN seat
+    # moves on clicks; a REMOTE seat (a hosted guest) moves on the server's
+    # queue.
 
     def start_game4(self, seats=None, viewer=_A_WHITE):
         """Open a four-army cross game. `seats` maps each army id to a seat
         ({"type": HUMAN/AI/REMOTE, "name": ...}); the default is one local
-        human (white) against three built-in engines."""
+        human (white) against three engines."""
         self.four = True
         self.game = Game4()
         self.variant = variants.create(self.settings["variant"], four=True)
         self.variant.replay([])
         if seats is None:
+            engine = self._default_engine(self._mode_token(4, "offline"))
             seats = {"w": {"type": HUMAN, "name": "You"},
-                     "b": {"type": AI, "name": "Computer"},
-                     "r": {"type": AI, "name": "Computer"},
-                     "bl": {"type": AI, "name": "Computer"}}
+                     "b": {"type": AI, "name": "Computer", "bot": engine},
+                     "r": {"type": AI, "name": "Computer", "bot": engine},
+                     "bl": {"type": AI, "name": "Computer", "bot": engine}}
         self.seats4 = seats
         self._viewer = viewer
-        # no external bot drives the cross: fligbot is a two-player engine, so
-        # the AI armies lean on the built-in mover instead
+        # every AI army needs an engine that plays this variant: there is no
+        # built-in mover any more, and no two-player bot instance is left
+        # hanging (seating guarantees the engine; a mode with none refuses to
+        # start rather than fall back to one that cannot read the cross board)
         self.bot = self.white_bot = None
         self._think = None
+        self._think4 = None
         self._end_t = 0.0
         self._reported_ply = -1
         self.history = []
@@ -1077,12 +1152,19 @@ class ChessApp:
         self.over_dismissed = False
         self._ai_t = 0.0
         self._refresh_fog4()
+        self._review[0]["fog"], self._review[0]["tint"] = self._view_fog_tint()
         self.state = GAME
 
     def _refresh_fog4(self):
-        """Which cross squares the current viewer may not see."""
-        self._fog = (self.variant.hidden(self.game.board, self._viewer)
-                     if self._viewer else frozenset())
+        """Which cross squares the current viewer may not see. A seated army
+        sees only its own blind spots; with nobody seated (an all-engine game
+        or a spectator) the screen shows the union of every standing army's
+        sight - fog over the tiles nobody can see, tinted by who can."""
+        if self._viewer:
+            self._fog = self.variant.hidden(self.game.board, self._viewer)
+            self._tint = {}
+        else:
+            self._fog, self._tint = self.variant.visibility(self.game.board)
 
     def _play4(self, move):
         """Play one cross move: record notation, re-derive fog/mines, journal
@@ -1099,8 +1181,10 @@ class ChessApp:
                              "blast": blasts[0][1] if blasts else None,
                              "check": notation.endswith(("+", "#"))})
         self.follow_latest = True
+        fog, tint = self._view_fog_tint()
         self._review.append({"cells": self._cross_snapshot(),
-                             "last": [move.from_sq, move.to_sq]})
+                             "last": [move.from_sq, move.to_sq],
+                             "fog": fog, "tint": tint})
         self.view_ply = None
         self.last_move = move
         self.selected = None
@@ -1119,11 +1203,15 @@ class ChessApp:
 
     def _update4(self, dt):
         """Advance the cross game one frame: relay the hosted lobby, then hand
-        a turn to the built-in mover, the guest's queued move, or a click."""
+        a turn to an engine, the guest's queued move, or a click."""
         self.glow_t += dt
         self.effects = [(e, x, y) for (e, x, y) in self.effects if not e.done]
         for effect, _, _ in self.effects:
             effect.update(dt)
+        # post the live report and quit on the finished result every frame,
+        # ahead of the early returns below, so a decided cross game still gets
+        # its last PGN out and its --report shutdown
+        self._report_and_exit(dt)
         if self.hosting and self.host is not None:
             self._host_pub_t += dt
             if self._host_pub_t >= 0.25:
@@ -1162,25 +1250,121 @@ class ChessApp:
                 return
             if self.host is not None and not self._remote_held(army):
                 # nobody holds this seat right now - never claimed, or its
-                # player left or went quiet - so the built-in mover covers
-                # the side instead of stalling the whole game
+                # player left or went quiet - so cover it with an engine that
+                # sees only what this army may know; with none for the mode
+                # the seat waits and the reason shows, never a cheat-mover
+                engine = self._default_engine(self._mode_token(4))
+                if engine is None:
+                    self.message = (const.NO_ENGINE_TITLE, const.NO_ENGINE_MSG)
+                    return
+                if self._bot_update4(army, {"type": AI, "name": engine,
+                                            "bot": engine}, dt):
+                    return
                 self._ai_t += dt
                 if self._ai_t < self.think_delay:
                     return
                 self._ai_t = 0.0
-                move = _mover4.choose(self.game.board, army)
+                move = self._closest(self.game.board.legal_moves(), None)
                 if move is not None:
                     self._play4(move)
             return
         if seat["type"] != AI:
             return                       # a local human's turn: wait for clicks
+        if seat.get("bot") and self._bot_update4(army, seat, dt):
+            return              # an engine owns this turn: it is thinking, or
+            # has its move and is holding it for the think delay
+        # An AI seat no engine can drive: seating guarantees an allowed engine,
+        # so this is reached only when that engine momentarily fails to start.
+        # Play a random legal move so the game cannot stall - never a mover
+        # that would see straight through the fog.
         self._ai_t += dt
         if self._ai_t < self.think_delay:
             return
         self._ai_t = 0.0
-        move = _mover4.choose(self.game.board, army)
+        move = self._closest(self.game.board.legal_moves(), None)
         if move is not None:
             self._play4(move)
+
+    def _make_bot4(self, name):
+        """Fresh instance of a cross engine, set the way that bot's saved
+        options are; None when it is not installed or will not start."""
+        cls = self.bots.get(name)
+        if cls is None:
+            return None
+        try:
+            bot = cls()
+            bot.configure(self.settings.bot_options(
+                name, getattr(cls, "CONFIG", {}) or {}))
+        except Exception as exc:  # noqa: BLE001 - a broken bot must not crash the game
+            print(f"{name} could not start: {exc}")
+            return None
+        budget = getattr(self.args, "budget", None)
+        if budget:
+            bot.budget = budget         # duck-typed: --budget every cross seat
+        return bot
+
+    def _bot_update4(self, army, seat, dt):
+        """Drive the engine seated on one cross army. True while it owns the
+        turn - thinking, or holding the move it found for the think delay -
+        and False when it cannot start at all, so the caller covers the army
+        with a random legal move. The engine works in its own thread, exactly
+        as a two-player bot does, so a deep search never stalls the frames, and
+        anything it says through `position.info.say()` goes into the chat."""
+        ply = len(self.game.moves)
+        think = self._think4
+        if think is not None and (think["army"] != army
+                                  or think["ply"] != ply):
+            # the board moved underneath it (undo, a restart, an opponent's
+            # edit): whatever the worker returns is stale, so start over
+            think = self._think4 = None
+        if think is None:
+            bot = self._make_bot4(seat["bot"])
+            if bot is None:
+                return False
+            count, net, variant = self._mode_parts(4)
+            info = GameInfo(count, variant, net, army)
+            box = {"move": None, "done": False}
+            # the variant decides what the engine may know, as it decides what
+            # the human on that army is shown
+            view = self.variant.bot_view(self.game.board)
+            # on the true board (classic) hand the engine its own repetition
+            # history, so it can refuse a shuffle rather than walk into the
+            # cross game's fourth-time-loss; under fog/mine the counts do not
+            # line up, so the progress filter is left to sleep
+            if variant == "classic":
+                info.seen = self.game.repetitions.get(_sig4(view), 0)
+                info.recent = frozenset(self.game.recent)
+            position = Position(view, info=info)
+
+            def work():
+                try:
+                    box["move"] = bot.choose(position)
+                except Exception as exc:  # noqa: BLE001 - never crash the game
+                    print(f"{bot.name} failed to pick a move: {exc}")
+                finally:
+                    box["done"] = True
+
+            threading.Thread(target=work, daemon=True).start()
+            self._think4 = {"army": army, "side": army, "ply": ply, "t": 0.0,
+                            "box": box, "info": info, "name": bot.name}
+            return True
+        think["t"] += dt
+        box = think["box"]
+        self._say_chat(think)
+        if not box["done"] or think["t"] < self.think_delay:
+            return True
+        move = box["move"]
+        think, self._think4 = think, None
+        self._say_chat(think)
+        legal = self.game.board.legal_moves()
+        if not legal or move is None:
+            return False       # nothing usable: let the caller cover it
+        # sanity-check the engine like any other player: an engine thinking
+        # under fog can aim at a square the real board forbids
+        if move not in legal:
+            move = self._closest(legal, move)
+        self._play4(move)
+        return True
 
     def _play_guest_move4(self, asked):
         """Turn a hosted guest's requested move (cross coordinate text) into a
@@ -1229,6 +1413,7 @@ class ChessApp:
         """Roll the cross game back one ply by replaying from the start, so the
         elimination sweep and any minefield run again in the same order."""
         self._think = None
+        self._think4 = None
         if not self.game.moves:
             return
         redo = variants.create(self.variant.key, self.variant.seed,
@@ -1248,13 +1433,14 @@ class ChessApp:
         self.last_move = self.game.moves[-1] if self.game.moves else None
         self.view_ply = None
 
-    def _draw_cross_cells(self, cells):
-        """Blit the pieces of a stored cross snapshot (used while reviewing)."""
+    def _draw_cross_cells(self, cells, fog=frozenset()):
+        """Blit the pieces of a stored cross snapshot (used while reviewing),
+        skipping any square that ply's own fog hides."""
         sq = self.csquare
         for y, row in enumerate(cells):
             for x, code in enumerate(row):
                 if (code in (".", const.CROSS_OFF)
-                        or not _cross_playable((x, y))):
+                        or not _cross_playable((x, y)) or (x, y) in fog):
                     continue
                 sprite = self.sprites4.get(code)
                 if sprite is None:
@@ -1276,13 +1462,20 @@ class ChessApp:
         overlay = pygame.Surface((w, h), pygame.SRCALPHA)
         board = self.game.board
         if self.reviewing():
+            # a past cross position wears its own fog and team tint
             entry = self._review[self.view_ply]
+            fog = self._review_fog(entry, _parse_cross)
+            tint = self._review_tint(entry, _parse_cross)
+            for fog_sq in fog:
+                x, y = self.cross_to_px(fog_sq)
+                pygame.draw.rect(overlay, COL_FOG, (x, y + status_h, sq, sq))
+            self._paint_tint(overlay, tint, self.cross_to_px, sq, status_h)
             for mv in (entry.get("last") or []):
                 x, y = self.cross_to_px(mv)
                 pygame.draw.rect(overlay, COL_LAST_MOVE,
                                  (x, y + status_h, sq, sq))
             self.screen.blit(overlay, (0, 0))
-            self._draw_cross_cells(entry["cells"])
+            self._draw_cross_cells(entry["cells"], fog)
             self.draw_status()
             self.draw_bottom_hint()
             self.draw_turn_indicators4()
@@ -1290,6 +1483,7 @@ class ChessApp:
         for fog_sq in self._fog:
             x, y = self.cross_to_px(fog_sq)
             pygame.draw.rect(overlay, COL_FOG, (x, y + status_h, sq, sq))
+        self._paint_tint(overlay, self._tint, self.cross_to_px, sq, status_h)
         if self.last_move:
             for mv in (self.last_move.from_sq, self.last_move.to_sq):
                 if mv in self._fog:
@@ -1426,6 +1620,17 @@ class ChessApp:
             self._applied_pos, self._applied_size = pos, size
         except Exception:
             self._drag = None
+            return
+        # relative-motion fallback (no global mouse): the anchors follow
+        # whatever was actually applied, so the window's own movement never
+        # feeds back into the next in-window cursor reading
+        d = self._drag
+        if d is not None and d.get("g0") is None:
+            if pos:
+                d["base"] = pos
+            if size:
+                d["bsize"] = size
+            d["m_anchor"] = pygame.mouse.get_pos()
 
     def pump_events(self):
         """Dispatch all queued events; returns False when the app should quit."""
@@ -1537,7 +1742,7 @@ class ChessApp:
             return False
         s["type"] = player
         if player == AI and s["bot"] not in self.bots:
-            self._set_seat_bot(seat, next(iter(self.bots)))
+            self._set_seat_bot(seat, self._default_engine())
         elif player == HUMAN:
             self._text_focus = None      # nothing to configure any more
         return True
@@ -1559,7 +1764,7 @@ class ChessApp:
         for color, s in clean_players(players).items():
             if s["type"] == AI:
                 if s["bot"] not in self.bots:
-                    s["bot"] = next(iter(self.bots), None)
+                    s["bot"] = self._default_engine()
                 if s["bot"] is None:
                     s["type"], s["bot"] = HUMAN, None
             spec = self.bots[s["bot"]].CONFIG if s["bot"] in self.bots else {}
@@ -1575,6 +1780,89 @@ class ChessApp:
         header read it from here instead of from a stored mode."""
         return SEAT_MODE.get((self.players["w"]["type"],
                               self.players["b"]["type"]), "human_vs_ai")
+
+    def _four_players(self):
+        """Is the arrangement being edited or played a four-army cross one?
+        True for a live cross game and for the setup pages that picked four
+        armies, so mode tokens are right before a game exists. Every flag is
+        read defensively so an early caller (validating the saved seats during
+        startup) sees the two-player answer rather than an attribute that has
+        not been set yet."""
+        return bool(getattr(self, "four", False)
+                    or getattr(self, "offline_players", 2) == 4
+                    or getattr(self, "lan_players", 2) == 4)
+
+    def _seat_duel(self):
+        """True when no human holds a seat: every army (or both colours) is
+        played by an engine, so the game is a duel the bots talk over."""
+        if self._four_players():
+            seats = list((getattr(self, "seats4", None)
+                          or getattr(self, "offline_seats", None)
+                          or {}).values())
+            return bool(seats) and not any(s.get("type") == HUMAN
+                                           for s in seats)
+        return self.duel()
+
+    def _net_kind(self):
+        """"offline", "lan" (a hosted or joined game) or "duel" - a game no
+        human plays. Read off the live flags, so it only answers for a page
+        or a game that has finished opening."""
+        if (getattr(self, "hosting", False) or getattr(self, "lan_client", False)
+                or getattr(self, "lan_mode", False)):
+            return "lan"
+        return "duel" if self._seat_duel() else "offline"
+
+    def _variant_key(self):
+        """The rules key a mode token is built from: always the chosen variant
+        in the settings. The rules page writes it the moment a ruleset is
+        picked and start_game turns it into the live variant, so a seat gated
+        on the setup pages - before the board has been rebuilt - is measured
+        against the rules it will actually be played under, not a stale
+        variant left over from the last game."""
+        return self.settings.get("variant", "classic")
+
+    def _mode_parts(self, players=None):
+        """(army count, network, variant) of the game being set up or played."""
+        if players is None:
+            players = 4 if self._four_players() else 2
+        return players, self._net_kind(), self._variant_key()
+
+    def _mode_token(self, players=None, net=None):
+        """The mode string engines declare themselves against:
+        "<n>p/<net>/<variant>", matched by prefix, so a bot that only knows
+        it plays two-player games lists ("2p",) and still matches every
+        2p mode, whatever its variant or network. `net` is read from the live
+        flags unless a caller states it, as the setup pages do."""
+        if players is None:
+            players = 4 if self._four_players() else 2
+        return "%dp/%s/%s" % (players, net or self._net_kind(),
+                              self._variant_key())
+
+    def _bot_allows(self, name, mode=None):
+        """Whether the installed bot `name` may sit a seat in this mode. A
+        bot declares its modes in its class attribute MODES and may overrule
+        the network half of it with LAN/DUEL; bots written before that API
+        existed default to two-player. The browser's force-all-modes toggle
+        overrides every declaration."""
+        cls = self.bots.get(name)
+        if cls is None:
+            return False
+        if self.settings.get("allow_all_modes"):
+            return True
+        return bot_allows(cls, mode or self._mode_token())
+
+    def _bots_for_mode(self, mode=None):
+        """Installed bot names that will play `mode`, in load order."""
+        mode = mode or self._mode_token()
+        return [name for name in self.bots if self._bot_allows(name, mode)]
+
+    def _default_engine(self, mode=None):
+        """The engine a computer seat falls back to when none is named: the
+        first installed engine allowed to play `mode`, or None when nothing
+        installed will. There is no built-in mover any more - with no engine
+        for the mode a seat cannot be filled and the game refuses to start."""
+        allowed = self._bots_for_mode(mode)
+        return allowed[0] if allowed else None
 
     def player_name(self, color):
         """What a side is called: the name typed for it on the setup page,
@@ -1600,8 +1888,11 @@ class ChessApp:
         return self.white_bot
 
     def duel(self):
-        """True when both sides are bots (AI vs AI mode)."""
-        return self.bot is not None and self.white_bot is not None
+        """True when both sides are bots (AI vs AI mode). Read defensively so
+        an early startup caller resolving a mode token never trips on bot
+        seats that have not been created yet."""
+        return (getattr(self, "bot", None) is not None
+                and getattr(self, "white_bot", None) is not None)
 
     # ----------------------------------------------------------------- fog
 
@@ -1617,14 +1908,54 @@ class ChessApp:
         return self.game.board.turn
 
     def _refresh_fog(self):
-        """Recompute which squares are hidden, for the current viewer."""
+        """Recompute the fog for the current view. A seated viewer sees only
+        its own army's blind spots; with nobody seated (a duel, an all-engine
+        game) the screen shows the union of every army's sight - fog over the
+        tiles nobody can see, and a per-tile tint naming who can."""
         self._viewer = self._viewer_color()
-        self._fog = (self.variant.hidden(self.game.board, self._viewer)
-                     if self._viewer else frozenset())
+        if self._viewer:
+            self._fog = self.variant.hidden(self.game.board, self._viewer)
+            self._tint = {}
+        else:
+            self._fog, self._tint = self.variant.visibility(self.game.board)
 
     def _shown(self, sq):
         """Can the viewer see this square at all right now?"""
         return sq not in self._fog
+
+    def _view_fog_tint(self):
+        """The active view's fog and tint as JSON-safe square names: parked
+        into every review entry so an earlier ply keeps its own fog (and team
+        tint) instead of the live one, and so the server can mask each stored
+        grid by it. A seated view has no tint; a union view tints each shown
+        tile with the armies that can see it."""
+        name = _cross_sq_name if self.four else sq_name
+        return ([name(sq) for sq in self._fog],
+                {name(sq): sorted(owners) for sq, owners in self._tint.items()})
+
+    def _paint_tint(self, overlay, tint, to_px, sq, status_h):
+        """Blend each shown tile's seeing-army tints onto the overlay - only
+        a union view carries a tint, so a seated view paints nothing."""
+        for tsq, owners in (tint or {}).items():
+            x, y = to_px(tsq)
+            pygame.draw.rect(overlay, _blend_tint(owners),
+                             (x, y + status_h, sq, sq))
+
+    @staticmethod
+    def _review_fog(entry, parse):
+        """A review ply's parked fog, back into board squares."""
+        return frozenset(filter(None, (parse(n)
+                                       for n in (entry.get("fog") or []))))
+
+    @staticmethod
+    def _review_tint(entry, parse):
+        """A review ply's parked tint, keyed by board square."""
+        out = {}
+        for name, owners in (entry.get("tint") or {}).items():
+            sq = parse(name)
+            if sq:
+                out[sq] = owners
+        return out
 
     def _report_and_exit(self, dt):
         """--report FILE: keep the live PGN current while an AI vs AI game
@@ -1647,15 +1978,20 @@ class ChessApp:
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
 
     def _bot_update(self, dt):
-        """Drive whichever bot is to move: think in a thread, play when done."""
+        """Drive whichever bot is to move: think in a thread, play when done,
+        and let anything it says through the chat channel reach the panel."""
         bot = self._side_bot(self.game.board.turn)
         if bot is None or self.game.result():
             return
         if self._think is None:
             box = {"move": None, "done": False}
+            side = self.game.board.turn
+            count, net, variant = self._mode_parts()
+            info = GameInfo(count, variant, net, side)
             # the variant decides what the bot is allowed to know, exactly
             # like it decides what the human is shown
-            position = Position(self.variant.bot_view(self.game.board))
+            position = Position(self.variant.bot_view(self.game.board),
+                                info=info)
 
             def work():
                 try:
@@ -1666,13 +2002,16 @@ class ChessApp:
                     box["done"] = True
 
             threading.Thread(target=work, daemon=True).start()
-            self._think = {"t": 0.0, "box": box}
+            self._think = {"t": 0.0, "box": box, "info": info,
+                           "name": bot.name, "side": side}
             return
         self._think["t"] += dt
         box = self._think["box"]
+        self._say_chat(self._think)
         if box["done"] and self._think["t"] >= self.think_delay:
             move = box["move"]
-            self._think = None
+            think, self._think = self._think, None
+            self._say_chat(think)
             legal = self.game.board.legal_moves()
             if legal:
                 # sanity-check the bot like any other player: a bot thinking
@@ -1680,6 +2019,16 @@ class ChessApp:
                 if move not in legal:
                     move = self._closest(legal, move)
                 self._play(move)
+
+    def _say_chat(self, think):
+        """Take everything the engine of a finished `think` state has said
+        since the last frame and put it in the chat."""
+        info = think.get("info")
+        if info is None:
+            return
+        for line in info.drain():
+            self._note_bot_say(think.get("name") or "Engine",
+                               think.get("side") or "", line)
 
     @staticmethod
     def _closest(legal, move):
@@ -1850,7 +2199,7 @@ class ChessApp:
                          "loading": True, "box": None, "action": None,
                          "scroll": 0, "center": None, "hit": [],
                          "close": None, "cap": None, "close_btn": None,
-                         "retry": None}
+                         "retry": None, "force": None}
         self._browser_fetch()
         self.sfx.play("click")
 
@@ -1877,6 +2226,7 @@ class ChessApp:
                     rows.append({"name": e["name"], "file": e["file"],
                                  "local": e.get("local"),
                                  "remote": e.get("remote"),
+                                 "modes": e.get("modes"),
                                  "hash": e.get("hash", ""),
                                  "app": e.get("app", ""),
                                  "state": state,
@@ -1885,9 +2235,11 @@ class ChessApp:
                 for p in sorted(bots_dir().glob("*.py")):
                     if p.name.startswith("_") or p.name in seen:
                         continue
+                    version, modes, _name = bot_updater.probe(p)
                     rows.append({"name": p.stem, "file": p.name,
-                                 "local": bot_updater.local_version(p),
-                                 "remote": None, "hash": "", "app": "",
+                                 "local": version,
+                                 "remote": None, "modes": modes, "hash": "",
+                                 "app": "",
                                  "state": "local", "blocked": False})
                 box["rows"] = rows
             except Exception as exc:  # noqa: BLE001 - show, never crash
@@ -1979,11 +2331,7 @@ class ChessApp:
     def _browser_headings(self, r):
         """Column captions above the list; the button column is left blank."""
         hy = r.y + 26
-        cols = ((const.BOT_HEADINGS[0], 0.03),
-                (const.BOT_HEADINGS[1], 0.40),
-                (const.BOT_HEADINGS[2], 0.50),
-                (const.BOT_HEADINGS[3], 0.60))
-        for text, frac in cols:
+        for text, frac in zip(const.BOT_HEADINGS, const.BOT_COL_FRACS):
             img = self.small_font.render(text, True, COL_MUTED)
             self.screen.blit(img, (r.x + int(r.w * frac), hy))
 
@@ -2041,23 +2389,26 @@ class ChessApp:
         return text + "\u2026"
 
     def _browser_draw_row(self, row, rr, buttons, note, mouse):
-        name = self.font.render(self._browser_ellipsis(row["name"],
-                                                       int(rr.width * 0.34)),
-                                True, COL_TEXT)
+        cols = const.BOT_COL_FRACS
+        f0, f1, f2, f3, f4 = cols
+        name = self.font.render(self._browser_ellipsis(
+            row["name"], int(rr.width * (f1 - f0)) - 12), True, COL_TEXT)
         self.screen.blit(name, (rr.x + 6, rr.centery - name.get_height() // 2))
         local = "-" if row["local"] is None else str(row["local"])
         remote = "-" if row["remote"] is None else str(row["remote"])
-        for frac, text in ((0.40, local), (0.50, remote)):
+        modes = row.get("modes")
+        mode_text = ", ".join(modes) if modes else "-"
+        for frac, text in ((f1, local), (f2, remote), (f3, mode_text)):
             img = self.small_font.render(text, True, COL_MUTED)
             self.screen.blit(img, (rr.x + int(rr.width * frac),
                                    rr.centery - img.get_height() // 2))
         stat = const.BOT_STATE_LABELS.get(row["state"], row["state"])
         st = self.small_font.render(stat, True, COL_ACCENT_LIT)
-        self.screen.blit(st, (rr.x + int(rr.width * 0.60),
+        self.screen.blit(st, (rr.x + int(rr.width * f4),
                               rr.centery - st.get_height() // 2))
         if note:                                        # blocked: explain below
             nt = self.small_font.render(note, True, xp.TEXT_MUTED)
-            self.screen.blit(nt, (rr.x + int(rr.width * 0.60),
+            self.screen.blit(nt, (rr.x + int(rr.width * f4),
                                   rr.bottom - nt.get_height()))
         for b, label, enabled in buttons:
             xp.button(self.screen, b, label, self.small_font,
@@ -2098,16 +2449,26 @@ class ChessApp:
             for row, rr, buttons, note in visible:
                 self._browser_draw_row(row, rr, buttons, note, mouse)
         self.screen.set_clip(old_clip)
+        # bottom strip, left to right: retry (only when the fetch failed),
+        # the force-all-modes checkbox, then the last action's result line
+        x = r.x + 8
+        cy = area.bottom + 15
         br["retry"] = None
         if br.get("error"):
-            rb = pygame.Rect(r.x + 8, area.bottom + 4, 90, 22)
+            rb = pygame.Rect(x, cy - 11, 90, 22)
             xp.button(self.screen, rb, const.BOT_BTN_RETRY, self.font,
                       hovered=rb.collidepoint(mouse))
             br["retry"] = rb
-        elif br.get("note"):
+            x = rb.right + 10
+        br["force"] = xp.checkbox(self.screen, (x, cy),
+                                  bool(self.settings.get("allow_all_modes")),
+                                  const.BOT_FORCE_MODES, self.small_font)
+        if not br.get("error") and br.get("note"):
             img = self.small_font.render(self._browser_ellipsis(
-                br["note"], area.width), True, COL_ACCENT_LIT)
-            self.screen.blit(img, (r.x + 8, area.bottom + 8))
+                br["note"], max(40, r.right - 12 - br["force"].right)),
+                True, COL_ACCENT_LIT)
+            self.screen.blit(img, (br["force"].right + 12,
+                                   cy - img.get_height() // 2))
         cb = pygame.Rect(r.right - 96, r.bottom - 30, 88, 24)
         xp.button(self.screen, cb, const.BOT_BTN_CLOSE, self.font,
                   hovered=cb.collidepoint(mouse))
@@ -2133,6 +2494,8 @@ class ChessApp:
                 self.close_bot_browser()
             elif br.get("retry") and br["retry"].collidepoint(pos):
                 self._browser_fetch()
+            elif br.get("force") and br["force"].collidepoint(pos):
+                self._toggle_force_modes()
             elif br.get("cap") and br["cap"].collidepoint(pos):
                 self._drag = {"kind": "browser",
                               "off": (pos[0] - r.centerx, pos[1] - r.centery)}
@@ -2158,6 +2521,13 @@ class ChessApp:
             self._drag = None
             return True
         return True
+
+    def _toggle_force_modes(self):
+        """Flip 'force allow all modes' and store it. The browser redraws
+        from the setting each frame, so no row data has to change."""
+        self.settings.cycle("allow_all_modes")
+        self.settings.save()
+        self.sfx.play("click")
 
     # ------------------------------------------------------ server stats
     # A host-only overlay opened by the View menu or the waiting room's Stats
@@ -2667,7 +3037,10 @@ class ChessApp:
 
     def pgn_text(self):
         """Portable Game Notation of the open game: the seven standard
-        header tags, the wrapped SAN move list and the result token."""
+        header tags, the wrapped SAN move list and the result token. A
+        four-army cross game uses its own compact form (see `_pgn_text4`)."""
+        if self.four:
+            return self._pgn_text4()
         result = {WHITE_WINS: "1-0", BLACK_WINS: "0-1",
                   DRAW: "1/2-1/2"}.get(self.game.result(), "*")
         white = self.player_name(WHITE)
@@ -2679,7 +3052,9 @@ class ChessApp:
                 '[Round "1"]',
                 f'[White "{white}"]',
                 f'[Black "{black}"]',
-                f'[Result "{result}"]']
+                f'[Result "{result}"]',
+                f'[Variant "{getattr(self.variant, "key", "classic")}"]',
+                '[Players "2"]']
         plies = [h["san"] for h in self.history]
         moves = []
         for i in range(0, len(plies), 2):
@@ -2688,6 +3063,50 @@ class ChessApp:
                 pair += f" {plies[i + 1]}"
             moves.append(pair)
         body = textwrap.fill(" ".join(moves), 75)
+        return "\n".join(head) + "\n\n" + \
+            (body + "\n" if body else "") + result + "\n"
+
+    def _seat4_name(self, army):
+        """Who plays a cross army, for a PGN name tag: its seat's own name,
+        or the engine seated on it, or the army's colour word."""
+        seat = (self.seats4 or {}).get(army, {})
+        return (seat.get("name") or seat.get("bot")
+                or const.ARMY_LABELS.get(army, army))
+
+    def _pgn_text4(self):
+        """Four-player PGN. The tags name all four armies and say it is a
+        cross game; the move list reads as compact coordinate tokens,
+        `"<army> <from>-<to>[=P]"`, chosen over SAN so the spectator can
+        replay them cheaply and without lag. The result token is the winning
+        army's name, a draw when the no-progress cap ended it, or '*' still
+        running."""
+        res = self.game.result()
+        if res == DRAW4:
+            result = "1/2-1/2"
+        elif res:
+            result = "%s wins" % ARMY_NAMES[res]
+        else:
+            result = "*"
+        head = ['[Event "FligChess game"]',
+                '[Site "FligChess"]',
+                '[Date "%s"]' % time.strftime("%Y.%m.%d"),
+                '[Round "1"]',
+                '[White "%s"]' % self._seat4_name("w"),
+                '[Black "%s"]' % self._seat4_name("b"),
+                '[Red "%s"]' % self._seat4_name("r"),
+                '[Blue "%s"]' % self._seat4_name("bl"),
+                '[Result "%s"]' % result,
+                '[Variant "%s"]' % getattr(self.variant, "key", "classic"),
+                '[Players "4"]']
+        tokens = []
+        for mv, h in zip(self.game.moves, self.history):
+            token = "%s %s-%s" % (h.get("mover", ""),
+                                  _cross_sq_name(mv.from_sq),
+                                  _cross_sq_name(mv.to_sq))
+            if mv.promotion:
+                token += "=" + mv.promotion.upper()
+            tokens.append(token)
+        body = textwrap.fill(" ".join(tokens), 75)
         return "\n".join(head) + "\n\n" + \
             (body + "\n" if body else "") + result + "\n"
 
@@ -2917,8 +3336,6 @@ class ChessApp:
         """Which of the four thin window edges the cursor grabs, if any."""
         if not self.windowed() or self._maximized:
             return None
-        if self.global_mouse() is None:
-            return None
         w, h = self.window
         g = 5
         edges = "".join(n for n, on in (("l", pos[0] < g),
@@ -2928,16 +3345,27 @@ class ChessApp:
         return edges or None
 
     def _begin_window_drag(self, kind, pos, edges=None):
-        """Anchor a move/resize drag on global-mouse + window geometry."""
+        """Anchor a move/resize drag on window geometry. When SDL can read
+        the desktop cursor the drag anchors on it - stable even when the
+        cursor leaves the window. When it cannot (Wayland, dummy driver) the
+        drag falls back to in-window mouse motion, re-anchored in
+        `_apply_window_drag` after every applied step so the window's own
+        movement never feeds back into the cursor reading."""
         win = self._sdlwin()
-        g0 = self.global_mouse()
-        if win is None or g0 is None:
+        if win is None:
             return False
         try:
-            self._drag = {"kind": kind, "g0": g0, "p0": win.position,
-                          "s0": self.window, "edges": edges or ""}
+            p0 = win.position
         except Exception:
             return False
+        g0 = self.global_mouse()
+        d = {"kind": kind, "g0": g0, "p0": p0, "s0": self.window,
+             "edges": edges or ""}
+        if g0 is None:
+            d["base"] = tuple(p0)
+            d["bsize"] = tuple(self.window)
+            d["m_anchor"] = pygame.mouse.get_pos()
+        self._drag = d
         return True
 
     def _chrome_press(self, pos):
@@ -3029,6 +3457,34 @@ class ChessApp:
                 return True
         return False
 
+    def _panel_size(self, kind):
+        """On-screen size of an in-window dialog (message / about / over /
+        browser / stats). Each rect is built around its stored centre, but
+        width and height never depend on the centre, so this reads the true
+        half-extents we need to keep a dragged popup inside the window."""
+        rect = {"message": self.message_rect, "about": self.about_rect,
+                "over": self.over_panel_rect, "browser": self._browser_rect,
+                "stats": self._stats_rect}[kind]()
+        return rect.size
+
+    def _clamp_center(self, center, size):
+        """Clamp a dialog centre so the whole panel stays within the window
+        rectangle. A panel wider or taller than the window simply centres on
+        that axis rather than getting pinned off-screen."""
+        w, h = self.window
+        pw, ph = size
+
+        def one(c, span, full):
+            # pygame puts a rect's top at centre - span//2, so its far edge
+            # lands at centre + (span - span//2): bound the centre by that
+            # true half so an odd-sized panel never spills one pixel over
+            lo, hi = span // 2, full - (span - span // 2)
+            if hi < lo:
+                return full // 2
+            return max(lo, min(int(c), hi))
+
+        return (one(center[0], pw, w), one(center[1], ph, h))
+
     def _update_drag(self, event):
         d = self._drag
         if not d:
@@ -3043,34 +3499,46 @@ class ChessApp:
             return
         if d["kind"] in ("over", "about", "message"):
             center = (event.pos[0] - d["off"][0], event.pos[1] - d["off"][1])
-            setattr(self, f"{d['kind']}_pos", center)
+            setattr(self, f"{d['kind']}_pos",
+                    self._clamp_center(center, self._panel_size(d["kind"])))
             return
         if d["kind"] == "browser" and self._browser is not None:
-            self._browser["center"] = (event.pos[0] - d["off"][0],
-                                       event.pos[1] - d["off"][1])
+            center = (event.pos[0] - d["off"][0], event.pos[1] - d["off"][1])
+            self._browser["center"] = self._clamp_center(
+                center, self._panel_size("browser"))
             return
         if d["kind"] == "stats" and self._stats is not None:
-            self._stats["center"] = (event.pos[0] - d["off"][0],
-                                     event.pos[1] - d["off"][1])
+            center = (event.pos[0] - d["off"][0], event.pos[1] - d["off"][1])
+            self._stats["center"] = self._clamp_center(
+                center, self._panel_size("stats"))
             return
         # window move/resize: only *record* the new geometry; the SDL calls
         # happen in _apply_window_drag, outside the event pump (see run())
         win = self._sdlwin()
-        g = self.global_mouse()
-        if win is None or g is None:
+        if win is None:
             return
-        dx, dy = g[0] - d["g0"][0], g[1] - d["g0"][1]
-        x0, y0, x1, y1 = self._virtual_desktop()
-        if abs(dx) > x1 - x0 or abs(dy) > y1 - y0:
-            return                    # implausible jump from a bad reading
+        if d["g0"] is not None:
+            g = self.global_mouse()
+            if g is None:
+                return
+            dx, dy = g[0] - d["g0"][0], g[1] - d["g0"][1]
+            x0, y0, x1, y1 = self._virtual_desktop()
+            if abs(dx) > x1 - x0 or abs(dy) > y1 - y0:
+                return            # implausible jump from a bad reading
+            base, bsize = d["p0"], d["s0"]
+        else:
+            # Wayland / dummy driver: no desktop cursor, so drive the drag off
+            # in-window motion against anchors re-set after every applied step
+            m = pygame.mouse.get_pos()
+            dx, dy = m[0] - d["m_anchor"][0], m[1] - d["m_anchor"][1]
+            base, bsize = d["base"], d["bsize"]
         if d["kind"] == "move":
-            x, y = self._clamp_pos(d["p0"][0] + dx, d["p0"][1] + dy,
-                                   d["s0"][0])
+            x, y = self._clamp_pos(base[0] + dx, base[1] + dy, bsize[0])
             self._win_pending = {"pos": (x, y)}
             return
         e = d["edges"]
-        x, y = d["p0"]
-        w, h = d["s0"]
+        x, y = base
+        w, h = bsize
         if "r" in e:
             w = max(MIN_WINDOW[0], w + dx)
         if "b" in e:
@@ -3354,19 +3822,31 @@ class ChessApp:
     # a cross game's per-army seat row: key "seat_<army>", value one of
     # const.LAN_SEAT_VALUES (engine, web seat, app seat)
     SEAT_PREFIX = "seat_"
+    # the engine row that follows an army set to Computer: key
+    # "seatbot_<army>", value a bot name; the built-in mover is gone, so a
+    # computer army always names a real, gate-allowed engine
+    SEAT_BOT_PREFIX = "seatbot_"
 
     def host_rows(self):
         """The settings page's rows for the game being set up. A two-player
         game uses the plain set; a cross game adds one row per army the host
         does not hold, each choosing whether that side is an engine, a seat
-        for browsers or a seat for other FligChess apps."""
+        for browsers or a seat for other FligChess apps - and, for an engine,
+        which engine."""
         rows = list(self.HOST_ROWS)
         form = self.host_form or {}
         if form.get("players") == 4:
             host_army = form.get("color", "w")
-            seat_rows = [(self.SEAT_PREFIX + army,
-                          const.LAN_ROW_SEAT % const.ARMY_LABELS[army])
-                         for army in _ARMY_IDS if army != host_army]
+            seat_rows = []
+            for army in _ARMY_IDS:
+                if army == host_army:
+                    continue
+                seat_rows.append((self.SEAT_PREFIX + army,
+                                  const.LAN_ROW_SEAT % const.ARMY_LABELS[army]))
+                if form.get(self.SEAT_PREFIX + army) == "ai":
+                    seat_rows.append(
+                        (self.SEAT_BOT_PREFIX + army,
+                         const.LAN_ROW_SEAT_BOT % const.ARMY_LABELS[army]))
             at = next((i for i, (key, _) in enumerate(rows)
                        if key == "hostai"), len(rows) - 1) + 1
             rows[at:at] = seat_rows
@@ -3375,6 +3855,21 @@ class ChessApp:
     def seat_kind(self, army):
         """Who the setup page says plays a cross army's side."""
         return (self.host_form or {}).get(self.SEAT_PREFIX + army, "ai")
+
+    def _host_bots(self, players=None):
+        """Engines the host page offers for the side the host itself plays:
+        a human (None) first, then every installed bot that will play the shape
+        of game being hosted. `players` falls back to the wizard's own choice."""
+        if players is None:
+            players = 4 if (self.host_form or {}).get("players") == 4 else 2
+        return [None] + self._bots_for_mode(self._mode_token(players, "lan"))
+
+    def _host_seat_bots(self):
+        """Engines the host page offers for a cross army's computer seat: only
+        those allowed to play a four-player LAN game. The built-in mover is
+        gone, so a computer army must be backed by a real engine."""
+        variant = (self.host_form or {}).get("variant", self.variant.key)
+        return self._bots_for_mode("4p/lan/%s" % variant)
 
     def _new_host_form(self, prev=None):
         """The settings page's values. Re-opening keeps what was typed but
@@ -3399,6 +3894,12 @@ class ChessApp:
             form[self.SEAT_PREFIX + army] = prev.get(
                 self.SEAT_PREFIX + army,
                 "web" if army == "b" and web else "ai")
+            # an engine army keeps the engine it was named with, so walking
+            # away from the page and back does not quietly drop it; a fresh
+            # army defaults to the engine that plays this cross game
+            form[self.SEAT_BOT_PREFIX + army] = prev.get(
+                self.SEAT_BOT_PREFIX + army) or self._default_engine(
+                    "4p/lan/%s" % form["variant"])
         return form
 
     def _server_tls(self):
@@ -3509,6 +4010,8 @@ class ChessApp:
             if (self.host_form or {}).get("players") == 4:
                 return const.ARMY_LABELS.get(value, const.ARMY_LABELS["w"])
             return const.VALUE_WHITE if value == "w" else const.VALUE_BLACK
+        if key.startswith(self.SEAT_BOT_PREFIX):
+            return value or "none installed"
         if key.startswith(self.SEAT_PREFIX):
             return const.LAN_SEAT_LABELS.get(value, value)
         if key in ("spectate", "lock", "web"):
@@ -3539,6 +4042,13 @@ class ChessApp:
             cur = self.seat_kind(key[len(self.SEAT_PREFIX):])
             i = opts.index(cur) if cur in opts else 0
             self.host_form[key] = opts[(i + step) % len(opts)]
+        elif key.startswith(self.SEAT_BOT_PREFIX):
+            # only the engines that play this cross game: there is no built-in
+            # mover to hand an army back to
+            opts = self._host_seat_bots()
+            cur = self.host_form.get(key)
+            i = opts.index(cur) if cur in opts else 0
+            self.host_form[key] = opts[(i + step) % len(opts)]
         elif key == "spectate":
             self.host_form["spectate"] = not self.host_form["spectate"]
         elif key == "lock":
@@ -3546,9 +4056,10 @@ class ChessApp:
         elif key == "web":
             self.host_form["web"] = not self.host_form["web"]
         elif key == "hostai":
-            # Human first, then every installed engine; with no bots there is
-            # nothing to seat, so the row simply stays on Human
-            opts = [None] + list(self.bots)
+            # the host playing its own side (None) first, then every engine
+            # that will play this shape of game; with no bots there is nothing
+            # to seat, so the row simply stays on the host's own hand
+            opts = self._host_bots()
             cur = self.host_form["hostai"]
             i = opts.index(cur) if cur in opts else 0
             self.host_form["hostai"] = opts[(i + step) % len(opts)]
@@ -3749,7 +4260,10 @@ class ChessApp:
         four = form.get("players", self.lan_players) == 4
         host_name = (form["host"] or "You")[:NAME_LIMIT]
         guest_name = "Guest"                 # a player names themselves
-        host_ai = form.get("hostai") if form.get("hostai") in self.bots else None
+        mode = "%dp/lan/%s" % (4 if four else 2, form["variant"])
+        host_ai = form.get("hostai")
+        if host_ai not in self.bots or not self._bot_allows(host_ai, mode):
+            host_ai = None               # the host plays its own side
         host_seat = {"type": AI if host_ai else HUMAN, "bot": host_ai,
                      "config": (dict(self.settings.bot_options(
                          host_ai, self.bots[host_ai].CONFIG)) if host_ai
@@ -3776,7 +4290,15 @@ class ChessApp:
                     continue
                 kind = self.seat_kind(army)
                 if kind == "ai":
-                    seats4[army] = {"type": AI, "name": "Computer"}
+                    # the setup page may name an engine for this army; with no
+                    # engine (or one that will not play this game) the seat
+                    # falls to the default engine that will - there is no
+                    # built-in mover now, so a computer army needs a real one
+                    bot = form.get(self.SEAT_BOT_PREFIX + army)
+                    if bot not in self.bots or not self._bot_allows(bot, mode):
+                        bot = self._default_engine(mode)
+                    seats4[army] = {"type": AI, "name": bot or "Computer",
+                                    "bot": bot}
                     continue
                 seats4[army] = dict(remote_seat)
                 open_seats.append({"color": army, "kind": kind})
@@ -3797,6 +4319,14 @@ class ChessApp:
                 self.players = {"w": host_seat, "b": remote_seat}
             else:
                 self.players = {"w": remote_seat, "b": host_seat}
+        # every computer army in a cross game needs an allowed engine; with
+        # none for this mode the game refuses to come up rather than seat a
+        # mover that would see straight through the fog
+        if four and any(s.get("type") == AI and not s.get("bot")
+                        for s in seats4.values()):
+            self.message = (const.NO_ENGINE_TITLE, const.NO_ENGINE_MSG)
+            self.four = False
+            return
         self.host = Host(port=port, password=form["password"],
                          spectate=form["spectate"], guest_name=guest_name,
                          host_name=host_name, tls=self._server_tls(),
@@ -4137,6 +4667,18 @@ class ChessApp:
         move = next((m for m in legal if m.promotion == want), legal[0])
         self._play(move)
 
+    def _spectator_view(self, board):
+        """The union view a spectator or engine duel is shown: the names of
+        the squares no standing army can see (`spec_fog`), and, for every
+        square that is shown, which armies can see it (`spec_tint`) so the
+        page tints each tile by team. A non-fog variant hides nothing, so both
+        come back empty and the whole board shows as it always did."""
+        hidden, owners = self.variant.visibility(board)
+        name = _cross_sq_name if self.four else sq_name
+        return {"spec_fog": [name(sq) for sq in hidden],
+                "spec_tint": {name(sq): sorted(owners[sq])
+                              for sq in owners}}
+
     def _host_snapshot(self):
         """The position as JSON, seen through the guest's eyes: fog hides
         what the variant keeps from them, and `dests` only lights up when the
@@ -4147,6 +4689,7 @@ class ChessApp:
         board = self.game.board
         guest = self.guest_color
         hidden = self.variant.hidden(board, guest)
+        spec = self._spectator_view(board)
         rows = ["".join(board.get((f, rank)) or "." for f in range(8))
                 for rank in range(7, -1, -1)]
         over = bool(self.game.result())
@@ -4189,6 +4732,11 @@ class ChessApp:
             # the handler strips it from the seated player's own payload
             "plies": self._review,
             "can_review": True,
+            # the union view for a spectator: fog over what no army sees, and
+            # the teams that can see each shown tile (the handler masks the
+            # grids with these)
+            "spec_fog": spec["spec_fog"],
+            "spec_tint": spec["spec_tint"],
         }
 
     def _host_snapshot4(self):
@@ -4213,6 +4761,7 @@ class ChessApp:
                  for army, seat in self.seats4.items()
                  if seat.get("type") == REMOTE and army != guest}
         hidden = view["hidden"]
+        spec = self._spectator_view(board)
         all_views = dict(views)
         all_views[guest] = view
         names = {a: const.ARMY_LABELS[a] for a in _ARMY_IDS}
@@ -4247,6 +4796,10 @@ class ChessApp:
                                   ("guest_color", "dests", "fog", "last",
                                    "you_can_move", "guest_name")}
                            for army, v in all_views.items()},
+            # the union view for a spectator: fog over what no army sees and
+            # the teams that see each shown tile (the handler masks with these)
+            "spec_fog": spec["spec_fog"],
+            "spec_tint": spec["spec_tint"],
         }
 
     def _guest_view4(self, board, army, over, started, last):
@@ -4632,6 +5185,7 @@ class ChessApp:
         self.client_army = None
         self._viewer = None
         self._fog = frozenset()
+        self._tint = {}
         self.chat_messages = []
         self.chat_open = False
         self._chat_focus = False
@@ -4671,8 +5225,20 @@ class ChessApp:
         # a spectator watches the whole board from nowhere in particular; only
         # a seated peer looks through their own side's eyes
         self._viewer = None if self.client_is_viewer else self.client_color
-        self._fog = frozenset(_parse_square(n) for n in snap.get("fog", [])
-                              if _parse_square(n))
+        if self.client_is_viewer:
+            # the server blanked the pieces no army sees and sent the union
+            # fog (to veil) plus the per-tile tint (to colour by team)
+            self._fog = frozenset(filter(None, (_parse_square(n)
+                                                for n in snap.get("spec_fog", []))))
+            self._tint = {}
+            for k, v in (snap.get("tint") or {}).items():
+                sqp = _parse_square(k)
+                if sqp:
+                    self._tint[sqp] = v
+        else:
+            self._fog = frozenset(filter(None, (_parse_square(n)
+                                                for n in snap.get("fog", []))))
+            self._tint = {}
         last = snap.get("last") or []
         if len(last) == 2:
             a, b = _parse_square(last[0]), _parse_square(last[1])
@@ -4765,8 +5331,20 @@ class ChessApp:
         # a spectator watches the whole cross from nowhere in particular; a
         # seated peer looks through their own army's eyes, fog and all
         self._viewer = own
-        self._fog = frozenset() if own is None else frozenset(
-            p for p in (_parse_cross(n) for n in snap.get("fog", [])) if p)
+        if own is None:
+            # a spectator: the server blanked the pieces no army sees and sent
+            # the union fog (to veil) plus the per-tile tint (to colour by team)
+            self._fog = frozenset(filter(None, (_parse_cross(n)
+                                                for n in snap.get("spec_fog", []))))
+            self._tint = {}
+            for k, v in (snap.get("tint") or {}).items():
+                sqp = _parse_cross(k)
+                if sqp:
+                    self._tint[sqp] = v
+        else:
+            self._fog = frozenset(filter(None, (_parse_cross(n)
+                                                for n in snap.get("fog", []))))
+            self._tint = {}
         last = snap.get("last") or []
         if len(last) == 2:
             a, b = _parse_cross(last[0]), _parse_cross(last[1])
@@ -4868,11 +5446,17 @@ class ChessApp:
         """Controls a column shows, top to bottom: who plays the side, which
         engine and what it is set to when that is a computer, then the name.
 
-        A four-player cross seat only offers player + name: every Computer army
-        is driven by the built-in mover, so there is no engine to pick or
-        configure on this page."""
+        A four-player cross seat offers player, engine and name: the engine
+        dropdown lists only the gate-allowed engines for this cross game, since
+        an AI army must be backed by a real engine now the built-in mover is
+        gone. An engine's own options stay on the two-player page, where seats
+        carry a config dict of their own."""
         if self.offline_players == 4:
-            return [("type", ""), ("name", "")]
+            rows = [("type", "")]
+            if (self.offline_seats.get(seat) or {}).get("type") == AI:
+                rows.append(("bot", ""))
+            rows.append(("name", ""))
+            return rows
         s = self.players[seat]
         rows = [("type", "")]
         if s["type"] == AI:
@@ -4928,7 +5512,11 @@ class ChessApp:
         if kind == "type":
             return [(TYPE_LABELS[t], t) for t in (HUMAN, AI)]
         if kind == "bot":
-            return [(name, name) for name in self.bots]
+            # only gate-allowed engines: an AI army needs a real engine, and an
+            # empty list ("none installed") means the game refuses to start
+            count = 4 if self.offline_players == 4 else 2
+            return [(name, name) for name in self._bots_for_mode(
+                self._mode_token(count))]
         if kind == "opt":
             spec = self.bots[self.players[seat]["bot"]].CONFIG[key]
             return [(str(v), v) for v in spec["choices"]]
@@ -4939,6 +5527,8 @@ class ChessApp:
         if self.offline_players == 4:
             if kind == "type":
                 self.offline_seats[seat]["type"] = value
+            elif kind == "bot":
+                self.offline_seats[seat]["bot"] = value
             self.sfx.play("select")
             self.settings.save()
             return
@@ -5039,17 +5629,27 @@ class ChessApp:
     def _default_offline_seats(self):
         """Fresh cross seats for the offline page: white and black carry over
         whatever the two colour seats already are (an engine collapses to a
-        Computer, since the cross plays its own mover), red and blue start as
-        Computer. Every one can then be flipped to Human for hot-seat play."""
+        Computer, and keeps its engine only when that engine will play a cross
+        board - else it takes the default engine for the mode), red and blue
+        start as Computer on the default engine. Every one can then be flipped
+        to Human for hot-seat play."""
+        mode = self._mode_token(4, "offline")
+        default = self._default_engine(mode)
+
         def seed(color):
             p = self.players.get(color) if hasattr(self, "players") else None
-            ptype = (p or {}).get("type", HUMAN)
+            p = p or {}
+            ptype = p.get("type", HUMAN)
             ptype = HUMAN if ptype == HUMAN else AI
-            return {"type": ptype, "name": (p or {}).get("name", "")
-                    or const.ARMY_LABELS[color]}
+            bot = p.get("bot")
+            keep = (ptype == AI and bot in self.bots
+                    and self._bot_allows(bot, mode))
+            bot = bot if keep else (default if ptype == AI else None)
+            return {"type": ptype, "bot": bot,
+                    "name": p.get("name", "") or const.ARMY_LABELS[color]}
         return {"w": seed("w"), "b": seed("b"),
-                "r": {"type": AI, "name": "Computer"},
-                "bl": {"type": AI, "name": "Computer"}}
+                "r": {"type": AI, "bot": default, "name": "Computer"},
+                "bl": {"type": AI, "bot": default, "name": "Computer"}}
 
     def four_columns(self):
         """A 2x2 grid of army panels for the offline four-player page: white
@@ -5114,13 +5714,24 @@ class ChessApp:
     def seats_from_offline(self):
         """The four-army seats an offline game plays, exactly as the cross
         page set them: any mix of humans (hot-seat) and Computers, each
-        Computer driven by the built-in mover. A blank name falls back to the
-        army's own colour word."""
+        Computer named a gate-allowed engine. A blank name falls back to the
+        army's own colour word, and an engine that is no longer installed (or
+        will not play this mode) simply takes the default engine."""
+        mode = self._mode_token(4, "offline")
+        default = self._default_engine(mode)
         seats = {}
         for army in _ARMY_IDS:
-            s = self.offline_seats.get(army, {"type": AI, "name": ""})
-            seats[army] = {"type": s["type"],
-                           "name": s["name"] or const.ARMY_LABELS[army]}
+            s = self.offline_seats.get(army, {})
+            stype = s.get("type", AI)
+            bot = s.get("bot")
+            if stype == AI:
+                bot = (bot if bot in self.bots and self._bot_allows(bot, mode)
+                       else default)
+            else:
+                bot = None
+            seats[army] = {"type": stype,
+                           "bot": bot,
+                           "name": s.get("name") or const.ARMY_LABELS[army]}
         return seats
 
     def offline_viewer(self, seats):
@@ -5183,25 +5794,42 @@ class ChessApp:
 
     def start_picked_game(self):
         """Start: the players are settled, so remember each engine's option
-        values as this page has them and play. Only an engine seat with no
-        engine to sit on it can be refused, and its own row says so. A four
-        player game needs no installed bot - the cross armies lean on the
-        built-in mover - so it skips that guard entirely."""
+        values as this page has them and play. Every computer seat must be
+        backed by an installed engine allowed to play this mode; a seat that
+        cannot be - no engine at all, or none for the variant - stops the
+        start with the reason rather than leaning on a built-in mover."""
         self.settings.save()
         self.sfx.play("click")
         self._drop = self._text_focus = None
         if self.offline_players == 4:
             seats = self.seats_from_offline()
+            if any(s["type"] == AI and not s.get("bot")
+                   for s in seats.values()):
+                self.message = (const.NO_ENGINE_TITLE, const.NO_ENGINE_MSG)
+                return
             self.start_game4(seats, self.offline_viewer(seats))
             return
         self.four = False          # a two-side start must leave the cross path
+        mode = self._mode_token(2)
         for seat in SEATS:
-            if self.players[seat]["type"] == AI \
-                    and self._seat_bot(seat) is None:
+            if self.players[seat]["type"] != AI:
+                continue
+            name = self.players[seat]["bot"]
+            if name not in self.bots:
+                # a computer seat must name an engine that is really installed
                 self.message = ("No bots installed",
                                 "Put a bot script into the bots/ folder,\n"
                                 "or set that player to Human.")
                 return
+            if not self._bot_allows(name, mode):
+                # installed, but this variant will not run it: seat the engine
+                # that does, and only a mode with no allowed engine at all
+                # can leave the seat unbacked enough to stop the start
+                fallback = self._default_engine(mode)
+                if fallback is None:
+                    self.message = (const.NO_ENGINE_TITLE, const.NO_ENGINE_MSG)
+                    return
+                self._set_seat_bot(seat, fallback)
         for seat in SEATS:
             name = self._seat_bot(seat)
             if name:
@@ -6084,6 +6712,21 @@ class ChessApp:
         if message and message not in self.chat_messages:
             self.chat_messages.append(message)
 
+    def _note_bot_say(self, who, side, text):
+        """One line an engine said through GameInfo.say(): into the chat panel
+        the local player sees, and through the server when one is up so guests
+        and peer apps read it in the same log as everything else."""
+        text = (text or "").strip()
+        if not text:
+            return
+        message = None
+        if self.host is not None:
+            try:
+                message = self.host.post_chat(who, text, color=side or "")
+            except Exception:  # noqa: BLE001 - a lost server must not stop play
+                message = None
+        self.note_chat(message or {"who": who, "text": text, "color": side})
+
     def _chat_pawn(self, color):
         """A small pawn sprite marking a chat line's side. All four armies -
         the plain white/black pair included - come off the cross minis, so
@@ -6237,8 +6880,19 @@ class ChessApp:
         overlay = pygame.Surface((w, h), pygame.SRCALPHA)
         animating = self.anim is not None and not reviewing
         if reviewing:
+            # a past position wears its own fog and tint, not the live view's
+            fog = self._review_fog(entry, _parse_square)
+            tint = self._review_tint(entry, _parse_square)
+        else:
+            fog = self._fog
+            tint = self._tint
+        for fog_sq in fog:               # the tiles this view may not see
+            x, y = self.square_to_px(fog_sq)
+            pygame.draw.rect(overlay, COL_FOG, (x, y + status_h, sq, sq))
+        self._paint_tint(overlay, tint, self.square_to_px, sq, status_h)
+        if reviewing:
             # a past position: just flag the two squares of the move that
-            # made it, no fog veil, selection or check - the game is on hold
+            # made it - the game is on hold, so no selection or check
             for name in (entry.get("last") or []):
                 mv = _parse_square(name)
                 if mv:
@@ -6246,18 +6900,15 @@ class ChessApp:
                     pygame.draw.rect(overlay, COL_LAST_MOVE,
                                      (x, y + status_h, sq, sq))
         else:
-            for fog_sq in self._fog:        # what the viewer may not see
-                x, y = self.square_to_px(fog_sq)
-                pygame.draw.rect(overlay, COL_FOG, (x, y + status_h, sq, sq))
             if not animating:
                 if self.last_move:
                     for mv in (self.last_move.from_sq, self.last_move.to_sq):
-                        if not self._shown(mv):
+                        if mv in fog:
                             continue        # a move lost in fog stays lost
                         x, y = self.square_to_px(mv)
                         pygame.draw.rect(overlay, COL_LAST_MOVE,
                                          (x, y + status_h, sq, sq))
-                if self.selected and self._shown(self.selected):
+                if self.selected and self.selected not in fog:
                     x, y = self.square_to_px(self.selected)
                     pygame.draw.rect(overlay, COL_SELECTED,
                                      (x, y + status_h, sq, sq))
@@ -6274,6 +6925,8 @@ class ChessApp:
             prow = entry["rows"]
             for rank in range(8):
                 for file_ in range(8):
+                    if (file_, rank) in fog:
+                        continue        # this ply's own fog hides the piece too
                     piece = prow[7 - rank][file_]
                     if piece and piece != ".":
                         sprite = self.sprites.get(piece)
@@ -6815,6 +7468,13 @@ def main(argv=None):
     ap.add_argument("--black", metavar="BOT",
                     help="bot playing Black; naming only one of the two"
                          " leaves the other side to a human")
+    ap.add_argument("--players", type=int, choices=(2, 4), default=2,
+                    help="army count for --autoplay: 4 opens a cross game")
+    ap.add_argument("--red", metavar="BOT",
+                    help="bot playing Red (a cross game; --white names the"
+                         " rest unless they too are named)")
+    ap.add_argument("--blue", metavar="BOT",
+                    help="bot playing Blue (a cross game)")
     ap.add_argument("--variant", metavar="KEY", choices=list(PICKS["variant"]),
                     help="rules variant: classic, fog or minefield")
     ap.add_argument("--monitor", metavar="NAME",
