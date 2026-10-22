@@ -1,0 +1,1 @@
+"""FligChess - chess app & bot."""

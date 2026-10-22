@@ -1,0 +1,264 @@
+name: build
+
+# Two lanes, decided by what changed in the push:
+#
+#   bot-only  - every touched file lives under bots/. The app itself is not
+#               rebuilt; instead each changed bot gets its version bumped in
+#               bots/<name>.meta.json, index.json is regenerated from the
+#               meta files (name/version/sha256) and everything is committed
+#               back to main. Installed apps pick the new bots up through
+#               Help > Update bots..., which reads exactly that index.json.
+#
+#   app       - anything outside bots/ changed: build the Windows and Linux
+#               packages. Each build ships the current bots/ folder plus a
+#               config/bundled_bots.json record of the bot versions that
+#               came with this app release, so the updater can add, refresh
+#               or delete bots on top of an installed app. A final release
+#               job publishes both platforms' zips, both installers and
+#               index.json into one rolling fligchessV<version> release.
+#
+# The test suite lives in tests/ on the developer's machine only: it is
+# git-ignored, never pushed, and no build step here depends on it.
+#
+# A token is needed only for private mirror repos or if anon api limits
+# reached; the in-app updater and the installer read config/updater.json
+# ({"token": ..., "repo": ...}) or GITHUB_TOKEN, and the installer also
+# offers a token field that gets written into the install for the app.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.diff.outputs.app }}
+      bots: ${{ steps.diff.outputs.bots }}
+      version: ${{ steps.diff.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Classify the push
+        id: diff
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            APP=true; BOTS=true          # manual run: everything, all bots
+          elif case "$GITHUB_REF" in refs/tags/*) true;; *) false;; esac; then
+            APP=true; BOTS=false         # release: build, never re-version
+          elif git rev-parse --verify -q HEAD^ >/dev/null; then
+            FILES=$(git diff --name-only HEAD^ HEAD)
+            APP=false; BOTS=false
+            for f in $FILES; do
+              case "$f" in
+                index.json|bots/*.meta.json) ;;   # CI output, not a change
+                bots/*) BOTS=true ;;
+                *) APP=true ;;
+              esac
+            done
+          else
+            APP=true; BOTS=true          # first commit: no parent to diff
+          fi
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "bots=$BOTS" >> "$GITHUB_OUTPUT"
+          echo "app=$APP bots=$BOTS"
+          # the rolling release is named after the one version constant, so a
+          # build never has to import the app to know which tag it publishes
+          VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' src/fligchess/version.py)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION tag=fligchessV$VERSION"
+
+  bot-updates:
+    # runs whenever bots changed (alone or alongside an app build); skips
+    # tag pushes so a release never rewrites its own commit
+    needs: changes
+    if: needs.changes.outputs.bots == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Headless bot smoke check
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: |
+          pip install pygame
+          python bots/fligbot.py
+      - name: Bump versions of changed bots
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            CHANGED=""                 # manual run: republish the index as is
+          elif git rev-parse --verify -q HEAD^ >/dev/null; then
+            CHANGED=$(git diff --name-only HEAD^ HEAD | grep '^bots/.*\.py$' || true)
+          else
+            CHANGED=$(git ls-files bots | grep '\.py$' || true)
+          fi
+          bump=""
+          for f in $CHANGED; do
+            base=$(basename "$f")
+            if [ -f "bots/${base%.py}.meta.json" ]; then
+              bump="$bump --bump $base"     # known bot: bump its version
+            fi                             # new bot: tool registers it at v1
+          done
+          echo "BUMP=$bump" >> $GITHUB_ENV
+      - name: Regenerate index.json
+        run: |
+          python tools/make_bot_index.py $BUMP
+          cat index.json
+      - name: Commit back to main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.json bots/
+          git diff --staged --quiet || {
+            git commit -m "bot index: update shipped bot versions [skip ci]"
+            git push origin HEAD:main
+          }
+
+  build-windows:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.app == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install pygame pyinstaller
+      - name: Make the Windows icon
+        run: python tools/make_ico.py
+      - name: Build one-file exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name FligChess
+          --icon src/fligchess/assets/logo.ico
+          --paths src --add-data "src/fligchess/assets;fligchess/assets"
+          src/fligchess/fligchess.py
+      - name: Stage portable folder
+        run: |
+          New-Item -ItemType Directory -Force dist/FligChess | Out-Null
+          Move-Item dist/FligChess.exe dist/FligChess/FligChess.exe
+          Copy-Item -Recurse bots dist/FligChess/bots
+          New-Item -ItemType Directory -Force dist/FligChess/config | Out-Null
+          Copy-Item src/fligchess/assets/logo.png dist/FligChess/logo.png
+          Copy-Item src/fligchess/assets/logo.ico dist/FligChess/logo.ico
+      - name: Record shipped bot versions
+        run: |
+          $list = @()
+          Get-ChildItem bots/*.meta.json | ForEach-Object {
+            $v = (Get-Content $_ -Raw | ConvertFrom-Json).version
+            $list += [pscustomobject]@{ file = $_.BaseName -replace '\.meta$', ''; version = $v }
+          }
+          (@{ bots = $list } | ConvertTo-Json) |
+            Set-Content "dist/FligChess/config/bundled_bots.json" -Encoding UTF8
+      - name: Zip the portable folder
+        run: Compress-Archive -Path dist/FligChess/* -DestinationPath dist/FligChess-windows.zip
+      - name: Build the XP installer
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --name FligChess-Installer
+          --icon src/fligchess/assets/logo.ico
+          --paths src --add-data "src/fligchess/assets;fligchess/assets"
+          installer/installer.py
+      - name: Name the installer asset
+        run: Move-Item dist/FligChess-Installer.exe dist/FligChess-Installer-windows.exe
+      - name: Hand the release files to the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/FligChess-windows.zip
+            dist/FligChess-Installer-windows.exe
+
+  build-linux:
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # PyInstaller needs objcopy from binutils for its ELF bootloading
+      - run: sudo apt-get update && sudo apt-get install -y binutils
+      - run: pip install pygame pyinstaller
+      - name: Build one-file binary
+        run: >
+          pyinstaller --noconfirm --onefile --name FligChess
+          --paths src --add-data "src/fligchess/assets:fligchess/assets"
+          src/fligchess/fligchess.py
+      - name: Stage portable folder
+        run: |
+          mv dist/FligChess dist/FligChess.bin
+          mkdir -p dist/FligChess/config
+          mv dist/FligChess.bin dist/FligChess/FligChess
+          chmod +x dist/FligChess/FligChess
+          cp -r bots dist/FligChess/bots
+          cp src/fligchess/assets/logo.png dist/FligChess/logo.png
+      - name: Record shipped bot versions
+        run: |
+          python - <<'PY'
+          import json, pathlib, re
+          bots = []
+          for meta in sorted(pathlib.Path("bots").glob("*.meta.json")):
+              version = json.loads(meta.read_text(encoding="utf-8"))["version"]
+              bots.append({"file": re.sub(r"\.meta$", "", meta.name),
+                           "version": version})
+          out = pathlib.Path("dist/FligChess/config/bundled_bots.json")
+          out.write_text(json.dumps({"bots": bots}, indent=2) + "\n",
+                         encoding="utf-8")
+          PY
+      - name: Zip the portable folder
+        run: (cd dist/FligChess && zip -r ../FligChess-linux.zip .)
+      - name: Build the XP installer
+        run: >
+          pyinstaller --noconfirm --onefile
+          --name FligChess-Installer
+          --paths src --add-data "src/fligchess/assets:fligchess/assets"
+          installer/installer.py
+      - name: Name the installer asset
+        run: mv dist/FligChess-Installer dist/FligChess-Installer-linux
+      - name: Hand the release files to the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/FligChess-linux.zip
+            dist/FligChess-Installer-linux
+
+  release:
+    # one job, one publish: collects both platforms' files and updates the
+    # rolling release in a single step, so the two builders can never race
+    # each other over the same tag
+    needs: [changes, build-windows, build-linux]
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist_assets
+          merge-multiple: true
+      - name: Publish the rolling release
+        # every push that builds the app refreshes the same fligchessV<version>
+        # release rather than waiting for a hand-made tag; bump APP_VERSION to
+        # start a new one
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fligchessV${{ needs.changes.outputs.version }}
+          allowUpdates: true
+          files: |
+            dist_assets/FligChess-windows.zip
+            dist_assets/FligChess-Installer-windows.exe
+            dist_assets/FligChess-linux.zip
+            dist_assets/FligChess-Installer-linux
+            index.json
