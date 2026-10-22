@@ -4,7 +4,7 @@
     {
       "name": "fligbot",
       "file": "fligbot.py",
-      "version": 3,
+      "version": 1,
       "sha256": "sha256:f1fa564eacf9bf9a028bb5ec6cce0882d6e6e4e80417911be54bbd7d283aa9df",
       "size": 58103,
       "app": "1.0.0"

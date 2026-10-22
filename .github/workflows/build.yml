@@ -3,10 +3,12 @@ name: build
 # Two lanes, decided by what changed in the push:
 #
 #   bot-only  - every touched file lives under bots/. The app itself is not
-#               rebuilt; instead each changed bot gets its version bumped in
-#               bots/<name>.meta.json, index.json is regenerated from the
-#               meta files (name/version/sha256) and everything is committed
-#               back to main. Installed apps pick the new bots up through
+#               rebuilt; instead each bot whose file was actually edited gets
+#               its version bumped in bots/<name>.meta.json (a bot merely
+#               added to the repo keeps the version its meta already records),
+#               index.json is regenerated from the meta files
+#               (name/version/sha256) and everything is committed back to
+#               main. Installed apps pick the new bots up through
 #               Help > Update bots..., which reads exactly that index.json.
 #
 #   app       - anything outside bots/ changed: build the Windows and Linux
@@ -69,8 +71,14 @@ jobs:
           echo "bots=$BOTS" >> "$GITHUB_OUTPUT"
           echo "app=$APP bots=$BOTS"
           # the rolling release is named after the one version constant, so a
-          # build never has to import the app to know which tag it publishes
-          VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' src/fligchess/version.py)
+          # build never has to import the app to know which tag it publishes.
+          # It lives in const.py; version.py is only a re-export shim, and
+          # parsing that yielded an empty version - a bare "fligchessV" tag.
+          VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' src/fligchess/const.py)
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read APP_VERSION from src/fligchess/const.py" >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION tag=fligchessV$VERSION"
 
@@ -98,9 +106,12 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             CHANGED=""                 # manual run: republish the index as is
           elif git rev-parse --verify -q HEAD^ >/dev/null; then
-            CHANGED=$(git diff --name-only HEAD^ HEAD | grep '^bots/.*\.py$' || true)
+            # only a bot already shipped and edited in this push is a bump;
+            # a file merely added (status A) carries its own recorded version
+            CHANGED=$(git diff --name-status HEAD^ HEAD \
+                      | awk '$1 == "M" && $2 ~ /^bots\/.*\.py$/ {print $2}')
           else
-            CHANGED=$(git ls-files bots | grep '\.py$' || true)
+            CHANGED=""                 # first commit: register, bump nothing
           fi
           bump=""
           for f in $CHANGED; do
