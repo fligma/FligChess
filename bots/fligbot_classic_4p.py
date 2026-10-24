@@ -1,6 +1,6 @@
 """fligbot classic 4p - the four-army search engine of FligChess.
 
-`fligbot classic` searches the classic 8x8. The cross board is a different
+`fligbot classic 2p` searches the classic 8x8. The cross board is a different
 game - four armies on a 14x14, no castling, three rivals instead of one - so
 it gets its own engine here: full alpha-beta over a flat cross array with
 precomputed rays, a transposition table, killer/history ordering, a capture
@@ -1239,11 +1239,13 @@ def enforce_progress(eng, position, moves, scores, best, best_score, cross):
 class FligBot4P(Bot):
     name = "fligbot classic 4p"
     author = "fligchess"
-    version = 3                 # v3: modes narrowed to classic + minefield
-    #                             (fog is left to `fligbot fog`, its own model)
+    version = 4                 # v4: seats the cross only; the mapped 2P shape
+    #                             stays in the engine for the bots that import
+    #                             it (blitz, fog), it is simply not offered as a
+    #                             two-player opponent any more - `fligbot
+    #                             classic 2p` and `fligbot blitz` cover those
     CONFIG = {}                 # no per-seat options: it always plays to win
-    MODES = ("2p/*/classic", "2p/*/minefield",
-             "4p/*/classic", "4p/*/minefield")   # cross + classic plain boards
+    MODES = ("4p/*/classic", "4p/*/minefield")     # the cross board only
     says = True                 # it announces a finished game through chat
 
     budget = 0.8                # seconds per move; the app's --budget overrides

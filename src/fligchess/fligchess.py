@@ -255,8 +255,13 @@ class ChessApp:
         self.fullscreen = self.settings["fullscreen"]
         self.window = DEFAULT_WINDOW
         self._win = None                 # single live SDL window wrapper
+        self._dll = _load_sdl_dll()      # read before the window is shaped
+        # a Wayland compositor decides where its windows go and ignores a
+        # client's request to move, so there the app keeps the system
+        # titlebar - the only one it can ever be dragged by
+        self._movable = const.client_can_place_window(self._video_driver())
+        self._os_title = "FligChess"     # what the system caption reads
         self.screen = self._set_mode()
-        self._dll = _load_sdl_dll()
         self._maximized = False
         self._last_cap = None          # (secs, pos) for titlebar double-click
         self._drag = None              # active drag operation, see handle_event
@@ -428,12 +433,15 @@ class ChessApp:
 
     def _apply_chrome(self):
         """Drop the system titlebar: the app paints and handles its own,
-        XP style, for the whole window."""
+        XP style, for the whole window. That only works where the app can
+        also place the window, so on Wayland the system caption stays on -
+        a borderless window there could never be moved off the spot it
+        opened on."""
         win = self._sdlwin(create=True)
         if win is None:
             return
         try:
-            win.borderless = not self.fullscreen
+            win.borderless = not self.fullscreen and self._movable
         except Exception:
             pass
 
@@ -468,6 +476,24 @@ class ChessApp:
 
     def windowed(self):
         return not self.fullscreen and self._sdlwin() is not None
+
+    def _video_driver(self):
+        """SDL's name for the video backend in use ("x11", "wayland",
+        "windows", "cocoa", "dummy"), or "" when it will not say."""
+        if self._dll is None:
+            return ""
+        try:
+            fn = self._dll.SDL_GetCurrentVideoDriver
+            fn.restype = ctypes.c_char_p
+            return (fn() or b"").decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    @property
+    def caption_h(self):
+        """Height of the caption strip this app paints: nothing at all
+        where the window keeps the system's own titlebar."""
+        return TITLEBAR_H if getattr(self, "_movable", True) else 0
 
     def global_mouse(self):
         """Desktop-wide cursor position: the only stable reference while a
@@ -718,7 +744,7 @@ class ChessApp:
         """Recompute every size from the current window (resize/fullscreen)."""
         w, h = self.window
         # chrome: caption + menu strip on top, grip status bar at the bottom
-        self.chrome_top = TITLEBAR_H + MENUBAR_H
+        self.chrome_top = self.caption_h + MENUBAR_H
         self.status_h = self.chrome_top + max(18, min(30, int(h * 0.05)))
         self.bottom_h = STATUSBAR_H
         row_h = self.status_h - self.chrome_top
@@ -1477,8 +1503,15 @@ class ChessApp:
             self.screen.blit(overlay, (0, 0))
             self._draw_cross_cells(entry["cells"], fog)
             self.draw_status()
+            # the scrubber itself has to stay on screen: a review board that
+            # hides it strands the game on that ply, with no Next and no Live
+            self.draw_review_strip()
             self.draw_bottom_hint()
             self.draw_turn_indicators4()
+            if self.settings["move_panel"] or self.chat_open:
+                self.draw_panel()
+            if self.show_over:
+                self.draw_game_over()
             return
         for fog_sq in self._fog:
             x, y = self.cross_to_px(fog_sq)
@@ -1989,9 +2022,17 @@ class ChessApp:
             count, net, variant = self._mode_parts()
             info = GameInfo(count, variant, net, side)
             # the variant decides what the bot is allowed to know, exactly
-            # like it decides what the human is shown
-            position = Position(self.variant.bot_view(self.game.board),
-                                info=info)
+            # like it decides what the human is shown; on the true board
+            # (classic) it also gets the game's own repetition history, so a
+            # winning engine can refuse the shuffle instead of pacing into a
+            # drawn game. Under fog/mine the counts do not line up with what
+            # the bot can see, so the progress filter is left to sleep.
+            view = self.variant.bot_view(self.game.board)
+            if variant == "classic":
+                key = " ".join(view.to_fen().split()[:4])
+                info.seen = self.game.repetitions.get(key, 0)
+                info.recent = frozenset(self.game.recent)
+            position = Position(view, info=info)
 
             def work():
                 try:
@@ -2045,7 +2086,7 @@ class ChessApp:
         """Hit areas for the drawn minimize/maximize/close caption buttons;
         mirrors the geometry xp.titlebar paints."""
         w = self.window[0]
-        top = (TITLEBAR_H - 16) // 2
+        top = (self.caption_h - 16) // 2
         close = pygame.Rect(w - 16 - 3, top, 16, 16)
         maximize = close.move(-(16 + 3), 0)
         minimize = close.move(-2 * (16 + 3), 0)
@@ -2063,7 +2104,7 @@ class ChessApp:
         rects, x = [], 6
         for label, _ in self.MENU_DEFS:
             w = self.small_font.size(label)[0] + 12
-            rects.append(pygame.Rect(x, TITLEBAR_H + 2, w, MENUBAR_H - 4))
+            rects.append(pygame.Rect(x, self.caption_h + 2, w, MENUBAR_H - 4))
             x += w + 2
         return rects
 
@@ -2126,9 +2167,14 @@ class ChessApp:
             return (self.state == GAME and self.duel()
                     and self.game is not None and not self.game.result()
                     and not self.duel_ended)
-        if text in ("Undo", "Resign"):
+        if text == "Undo":
             return (self.state == GAME and self.game is not None
                     and not self.game.result() and not self.duel())
+        if text == "Resign":
+            # a seat only this app's own human holds can be given up: an
+            # all-engine game on either board has nothing to resign, and the
+            # cross only ends on a last king, never on one army walking out
+            return self._resign_side() is not None
         if text == "Export game history...":
             return self.state == GAME and bool(self.history)
         if text == "Update bots...":
@@ -2994,18 +3040,54 @@ class ChessApp:
         if box.get("stale"):
             self._update_avail = ", ".join(box["stale"])
 
-    def _resign(self):
-        """The human side gives up: whoever is to move when they are not a
-        bot (never reachable in an AI vs AI duel, the menu item is greyed)."""
+    def _resign_side(self):
+        """The side this app may give up: the colour or army a local human
+        actually holds, preferring whoever is to move. None when nothing here
+        is the app's to resign - every seat an engine (an all-bot LAN game, a
+        cross played out by itself), or a hosted board whose only human seat is
+        the browser guest's own colour, which resigns through its own button.
+
+        Both the menu's grey-out and `_resign` read this one answer, so a stray
+        call can never hand a seat to the other side of the board."""
         if self.state != GAME or self.game is None or self.game.result():
-            return
+            return None
         turn = self.game.board.turn
-        loser = turn if not self._side_bot(turn) else next(
-            c for c in (WHITE, BLACK) if not self._side_bot(c))
-        self.game.resigned = loser
+        if self.four:
+            seats = self.seats4 or {}
+            standing = self.game.standing()
+            for army in (turn,) + tuple(a for a in _ARMY_IDS if a != turn):
+                if army not in standing:
+                    continue           # an army already out has nothing to give
+                if (seats.get(army) or {}).get("type") == HUMAN:
+                    return army
+            return None
+        for color in (turn, BLACK if turn == WHITE else WHITE):
+            if (self.seat(color)["type"] == HUMAN
+                    and not (self.hosting and color == self.guest_color)):
+                return color
+        return None
+
+    def _resign(self):
+        """The human side gives up. On the cross that means its army leaves the
+        board and the other armies play on to last-standing - so the result
+        overlay goes up only when the game really ended, never on the
+        resignation itself. Nothing happens where this app holds no human
+        seat."""
+        loser = self._resign_side()
+        if loser is None:
+            return
         self._think = None
+        self._think4 = None
         self.over_dismissed = False
-        if not self.anim:
+        if self.four:
+            # the game's own way, which takes the army off the board and hands
+            # the turn on; setting `.resigned` alone leaves the pieces standing
+            # and no result, which the overlay would then have to invent
+            self.game.resign(loser)
+            self._refresh_fog4()
+        else:
+            self.game.resigned = loser
+        if self.game.result() and not self.anim:
             self.show_over = True
             self.sfx.play("end")
 
@@ -3333,8 +3415,10 @@ class ChessApp:
             self.toggle_fullscreen()
 
     def resize_edges(self, pos):
-        """Which of the four thin window edges the cursor grabs, if any."""
-        if not self.windowed() or self._maximized:
+        """Which of the four thin window edges the cursor grabs, if any.
+        The system's own border is the grab handle where this app cannot
+        place its window, so no edge of the client area answers there."""
+        if not self._movable or not self.windowed() or self._maximized:
             return None
         w, h = self.window
         g = 5
@@ -3351,6 +3435,8 @@ class ChessApp:
         drag falls back to in-window mouse motion, re-anchored in
         `_apply_window_drag` after every applied step so the window's own
         movement never feeds back into the cursor reading."""
+        if not self._movable:
+            return False
         win = self._sdlwin()
         if win is None:
             return False
@@ -3369,7 +3455,11 @@ class ChessApp:
         return True
 
     def _chrome_press(self, pos):
-        """Handle presses on the drawn caption / window edges."""
+        """Handle presses on the drawn caption / window edges. Nothing is
+        drawn to press where the window keeps the system titlebar, and the
+        click belongs to the menu bar instead."""
+        if not self._movable:
+            return False
         minimize, maximize, close = self.caption_button_rects()
         if close.collidepoint(pos):
             pygame.event.post(pygame.event.Event(pygame.QUIT))
@@ -3383,7 +3473,7 @@ class ChessApp:
         edges = self.resize_edges(pos)
         if edges:
             return self._begin_window_drag("resize", pos, edges)
-        if pygame.Rect(0, 0, self.window[0], TITLEBAR_H).collidepoint(pos):
+        if pygame.Rect(0, 0, self.window[0], self.caption_h).collidepoint(pos):
             self.open_menu = None
             now = pygame.time.get_ticks() / 1000.0
             if (self._last_cap and now - self._last_cap[0] < 0.45
@@ -3623,12 +3713,22 @@ class ChessApp:
         return f"FligChess - {self.variant.label} - {mode}"
 
     def draw_chrome(self):
-        """Paint the app as one big XP window: caption, menu bar, grip bar."""
+        """Paint the app as one big XP window: caption, menu bar, grip bar.
+        The caption strip is skipped wherever the system titlebar is left on
+        the window, so the menu bar simply starts at the top there."""
         w, h = self.window
         self.screen.fill(COL_BG)
-        cap = pygame.Rect(0, 0, w, TITLEBAR_H)
-        xp.titlebar(self.screen, cap, self.window_title(), self.font,
-                    getattr(self, "app_icon", None))
+        cap = pygame.Rect(0, 0, w, self.caption_h)
+        if cap.height:
+            xp.titlebar(self.screen, cap, self.window_title(), self.font,
+                        getattr(self, "app_icon", None))
+        else:
+            # nothing is drawn to read here, so the system caption carries
+            # what this window is: it only changes when the game does
+            title = self.window_title()
+            if title != self._os_title:
+                self._os_title = title
+                pygame.display.set_caption(title)
         bar = pygame.Rect(0, cap.bottom, w, MENUBAR_H)
         xp.menubar(self.screen, bar, active=self.open_menu,
                    font=self.small_font,
@@ -6583,8 +6683,7 @@ class ChessApp:
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.chat_open and self.handle_chat_click(event.pos):
                 return
-            if (self.hosting or self.lan_client) \
-                    and self.chat_btn.collidepoint(event.pos):
+            if self.chat_btn.collidepoint(event.pos):
                 self.chat_open = not self.chat_open
                 self._chat_focus = False
                 self._layout()          # reserve/release the docked-chat column
@@ -6679,9 +6778,36 @@ class ChessApp:
             self._chat_focus = False
         return True
 
+    def _local_speaker(self):
+        """Who a typed line offline belongs to: the human whose turn it is,
+        or - when an engine is on move - the human on the other side, since
+        that is whoever is holding the mouse. A board with no human seat at
+        all (a game played out between engines) speaks as "You": nothing
+        else owns this app's keyboard. Returns (name, army) with the army in
+        the chat's own "w"/"b"/"r"/"bl" spelling."""
+        turn = self.game.board.turn if self.game is not None else None
+        if self.four:
+            seats = self.seats4 or {}
+            for army in ((turn,) + tuple(a for a in _ARMY_IDS
+                                         if a != turn)):
+                seat = seats.get(army) or {}
+                if seat.get("type") == HUMAN:
+                    return (seat.get("name")
+                            or const.ARMY_LABELS[army]), army
+            return "You", (turn if turn in _ARMY_IDS else _A_WHITE)
+        for color in ((turn,) + tuple(c for c in (WHITE, BLACK)
+                                      if c != turn)):
+            if self.seat(color)["type"] == HUMAN:
+                return (self.player_name(color),
+                        "w" if color == WHITE else "b")
+        return "You", ("w" if turn == WHITE else "b")
+
     def send_chat(self):
         """Post what is typed into the shared log. The host writes straight
-        through its server; a LAN client sends it over the wire instead."""
+        through its server; a LAN client sends it over the wire instead; and
+        offline there is nobody to ask but this app, so the line joins the log
+        the local player reads - which is where the engines' own remarks
+        already arrive (see `_note_bot_say`)."""
         text = (self._chat_input or "").strip()
         if not text:
             return
@@ -6705,6 +6831,13 @@ class ChessApp:
                 return
             # no local echo: the host relays the message back through the
             # next poll, with its sequence number, like any other line
+        else:
+            # offline: this app's log is the whole conversation, so the line
+            # is appended here rather than sent anywhere (and, unlike a
+            # received line, twice-typed text is kept twice)
+            who, side = self._local_speaker()
+            self.chat_messages.append({"who": who, "text": text,
+                                       "color": side})
         self.sfx.play("click")
 
     def note_chat(self, message):
@@ -7028,9 +7161,10 @@ class ChessApp:
             if watching:
                 text += const.STATUS_WATCHING % watching
         row_top, row_h = self.chrome_top, self.status_h - self.chrome_top
-        online = self.hosting or self.lan_client
-        leftmost = self.chat_btn.left if online else self.flip_btn.left
-        max_w = leftmost - 24
+        # the chat belongs to every game, offline included: the log is this
+        # app's own, and an engine's remarks land in it whether or not a
+        # server is up. Only the share (QR) button stays a host-only thing
+        max_w = self.chat_btn.left - 24
         img = self._fit_text(self.font, text, max_w)
         self.screen.blit(img, (12, row_top + (row_h - img.get_height()) // 2))
         # flip-board button: two stacked triangles, like a list-sort glyph
@@ -7046,8 +7180,7 @@ class ChessApp:
                              (cx, cy + 6)])
         if self.hosting:
             self._draw_qr_button(mouse)
-        if online:
-            self._draw_chat_button(mouse)
+        self._draw_chat_button(mouse)
         # etched separator under the status row, like a toolbar well
         y = self.status_h - 3
         pygame.draw.line(self.screen, xp.SHADOW, (6, y), (self.window[0] - 6, y))

@@ -35,11 +35,11 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 import fligbot_classic_4p as _classic                       # noqa: E402
 
-# Blitz borrows the classic engine's 2P opening book so it does not have to
+# Blitz borrows the two-player engine's opening book so it does not have to
 # invent an opening at a fraction of a second. Imported defensively: if only
 # blitz is installed the import fails and it simply searches from move one.
 try:
-    import fligbot_classic as _c2p
+    import fligbot_classic_2p as _c2p
 except Exception:
     _c2p = None
 
@@ -54,7 +54,8 @@ _xy = _classic._xy
 class FligBotBlitz(Bot):
     name = "fligbot blitz"
     author = "fligchess"
-    version = 3                 # v3: modes narrowed to classic + minefield
+    version = 4                 # v4: borrows the renamed `fligbot classic 2p`
+    #                             book (v3 pointed at the old file name)
     CONFIG = {}                 # no per-seat options: it always plays fast
     MODES = ("2p/*/classic", "2p/*/minefield")   # two-player plain board only
     says = True                 # it announces a finished game through chat

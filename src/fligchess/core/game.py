@@ -14,7 +14,8 @@ class ChessGame:
     def __init__(self, board=None):
         self.board = board or Board.startpos()
         self.moves = []          # moves played this game
-        self.repetitions = {}    # fen -> count
+        self.repetitions = {}    # position signature -> times offered to a mover
+        self.recent = []         # last offered positions, newest last
         self.resigned = None     # color that resigned, ends the game
         self._record_position()
 
@@ -95,8 +96,18 @@ class ChessGame:
         return " ".join(parts[:4])
 
     def _record_position(self):
+        """Tally the position now offered to the mover.
+
+        The window of recent keys is what lets an engine tell a forward move
+        from a shuffle: threefold repetition draws a plain game, and a search
+        that reads the shuffle as free will happily halve a won point. Kept
+        recomputed from the move list, like everything else here, so an undo
+        lands on exactly the same counts."""
         key = self._position_key()
         self.repetitions[key] = self.repetitions.get(key, 0) + 1
+        self.recent.append(key)
+        if len(self.recent) > RECENT_WINDOW:
+            del self.recent[:-RECENT_WINDOW]
 
     # ------------------------------------------------------------- utilities
 
@@ -130,7 +141,11 @@ ARMY_NAMES = {"w": "White", "b": "Black", "r": "Red", "bl": "Blue"}
 DRAW4 = "draw"          # result sentinel when the absolute cap was reached
 REP_CAP = 4             # position offered to a mover this many times -> it loses
 MAX_PLIES4 = 1500       # last-resort ceiling so a 4P game always terminates
-RECENT_WINDOW = 24      # last offered positions a cross engine is warned about
+# How many of the positions just played a mover is warned about. Both boards
+# carry the same window: the two-player engine wants it for the same reason -
+# a repeat is one step nearer a drawn game - and the app hands it over the same
+# `GameInfo.recent` field.
+RECENT_WINDOW = 24      # last offered positions an engine is warned about
 
 
 def _sig4(board):

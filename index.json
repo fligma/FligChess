@@ -4,9 +4,9 @@
     {
       "name": "fligbot blitz",
       "file": "fligbot_blitz.py",
-      "version": 3,
-      "sha256": "sha256:83d561e04fd3418d96d1a2b18bf2056f23c3b2582ab46eaf980a7acea1473df2",
-      "size": 6990,
+      "version": 4,
+      "sha256": "sha256:a11cafe8ad12f8b113ccc5c017441c36af8cf29817382677eb46c252b1cecc91",
+      "size": 7069,
       "app": "1.1.0",
       "modes": [
         "2p/*/classic",
@@ -14,11 +14,11 @@
       ]
     },
     {
-      "name": "fligbot classic",
-      "file": "fligbot_classic.py",
-      "version": 5,
-      "sha256": "sha256:7dc394d3d9ad5760b28b9a8d1411f3f5d437df77b18339fec46017d4b72fc8a9",
-      "size": 69322,
+      "name": "fligbot classic 2p",
+      "file": "fligbot_classic_2p.py",
+      "version": 6,
+      "sha256": "sha256:af5454703450890a5267262d6830fa214ec0646f98396904afc42eeed784fc3d",
+      "size": 99774,
       "app": "1.1.0",
       "modes": [
         "2p/*/classic",
@@ -28,13 +28,11 @@
     {
       "name": "fligbot classic 4p",
       "file": "fligbot_classic_4p.py",
-      "version": 3,
-      "sha256": "sha256:d14f6a3bbe3887f7e171b3783ac4ff76c0e97e886c8ce46c098b65e3bfb4a6d6",
-      "size": 52869,
+      "version": 4,
+      "sha256": "sha256:38953d73c2d8c2f2cd18a0fed4b9ebee2dfcc65ba81456d90b58fafb838d6f95",
+      "size": 53055,
       "app": "1.1.0",
       "modes": [
-        "2p/*/classic",
-        "2p/*/minefield",
         "4p/*/classic",
         "4p/*/minefield"
       ]

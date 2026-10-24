@@ -8,7 +8,7 @@ Version numbers live in `bots/<file>.meta.json` (written by the CI when a
 bot changes; see .github/workflows/build.yml). A brand-new bot with no
 meta file is registered at version 1.
 
-Usage:  python tools/make_bot_index.py [--bump fligbot_classic.py]
+Usage:  python tools/make_bot_index.py [--bump fligbot_classic_2p.py]
 """
 
 import argparse

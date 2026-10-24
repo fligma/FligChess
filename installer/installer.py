@@ -120,6 +120,10 @@ class Installer:
         self._close_btn = None           # caption close box, set on first draw
         self._win = None                 # the one live SDL window wrapper
         self._dll = _load_sdl_dll()      # for the global mouse while dragging
+        # a Wayland compositor ignores a client's request to move its window,
+        # so there the installer keeps the native titlebar - the drawn one
+        # would be a handle attached to a window that cannot be dragged
+        self._movable = const.client_can_place_window(self._video_driver())
         self._drag = None                # active move/resize grab, see _drag_start
         self._win_pending = None         # {"pos", "size"} to apply outside the pump
         self._layout()
@@ -149,8 +153,8 @@ class Installer:
 
     def _layout(self):
         w, h = self.size
-        self.title = pygame.Rect(0, 0, w, TITLEBAR_H)
-        lx, top = 18, TITLEBAR_H + 16
+        self.title = pygame.Rect(0, 0, w, self.caption_h)
+        lx, top = 18, self.caption_h + 16
         self.info_rect = pygame.Rect(lx, top, w - 2 * lx, 54)
         top += 66
         self.path_label = pygame.Rect(lx, top, w - 2 * lx, 16)
@@ -193,10 +197,30 @@ class Installer:
                 return None
         return self._win
 
+    def _video_driver(self):
+        """SDL's name for the video backend in use ("x11", "wayland",
+        "windows", "cocoa", "dummy"), or "" when it will not say."""
+        if self._dll is None:
+            return ""
+        try:
+            fn = self._dll.SDL_GetCurrentVideoDriver
+            fn.restype = ctypes.c_char_p
+            return (fn() or b"").decode("utf-8", "replace")
+        except Exception:
+            return ""
+
+    @property
+    def caption_h(self):
+        """Height of the caption strip the installer paints: nothing where
+        the window keeps the system's own titlebar."""
+        return TITLEBAR_H if getattr(self, "_movable", True) else 0
+
     def _apply_icon_and_chrome(self):
         """Give the window the FligChess logo icon and drop the native
         titlebar, so the installer looks like the main app: one drawn Luna
-        caption, the FligChess icon in the taskbar. Both degrade to nothing
+        caption, the FligChess icon in the taskbar. Where this app cannot
+        place its own window (Wayland) the native one stays on, since it is
+        the only caption that can be dragged there. Both degrade to nothing
         when SDL cannot help (headless), never crash."""
         if self.logo is not None:
             try:
@@ -206,7 +230,7 @@ class Installer:
         win = self._sdlwin(create=True)
         if win is not None:
             try:
-                win.borderless = True
+                win.borderless = self._movable
             except Exception:
                 pass
 
@@ -236,6 +260,8 @@ class Installer:
         back to in-window motion, re-anchored after every applied step so
         the window's own movement never feeds back into the cursor reading.
         Returns True when the press was eaten."""
+        if not self._movable:
+            return False          # the system border is the handle here
         close = getattr(self, "_close_btn", None)
         if close and close.collidepoint(pos):
             return False
@@ -263,6 +289,8 @@ class Installer:
 
     def _resize_edges(self, pos):
         """Which border band the point grabs: a string of l/r/t/b."""
+        if not self._movable:
+            return ""
         w, h = self.size
         return "".join(n for n, on in (
             ("l", pos[0] < EDGE_GRAB), ("r", pos[0] >= w - EDGE_GRAB),
@@ -490,9 +518,11 @@ class Installer:
 
     def draw(self):
         self.screen.fill(xp.FACE)
-        close = xp.titlebar(self.screen, self.title, "Install FligChess",
-                            self.font, icon=self.icon)
-        self._close_btn = close
+        # no caption is drawn where the window wears the system's own, and
+        # with it no close box: the native one handles both jobs
+        self._close_btn = xp.titlebar(self.screen, self.title,
+                                      "Install FligChess", self.font,
+                                      icon=self.icon) if self.caption_h else None
         self._draw_release()
         self._draw_main()
         if self.browse is not None:

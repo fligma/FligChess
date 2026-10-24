@@ -6,7 +6,7 @@ colour from the player setup page, and its `CONFIG` entries appear there as
 dropdowns of their own.
 
 Bots should only import from `fligchess.core` (this module re-exports
-`Board`, `Move`, `WHITE` and `BLACK` through it). See `bots/fligbot_classic.py`
+`Board`, `Move`, `WHITE` and `BLACK` through it). See `bots/fligbot_classic_2p.py`
 for a complete example.
 
 Every game hands its bot a `GameInfo` on `position.info`: how many armies
@@ -220,7 +220,10 @@ class Bot:
                    the game's "<players>p/<net>/<variant>" by prefix, or
                    segment-wise with "*" standing for any one segment, so
                    "2p/*/classic" takes every two-player classic game and
-                   "4p/*/fog" only four-army fog. The app only seats the bot
+                   "4p/*/fog" only four-army fog. Declare only the shapes the
+                   search really plays - a two-player engine lists just 2p, a
+                   cross engine just 4p - so a setup page offers nothing it
+                   would have to refuse at the seat. The app only seats the bot
                    where its modes fit, unless the "force allow all modes"
                    toggle in the bot browser is on.
         LAN / DUEL -- shorthand overrides for the net part of a token, for a

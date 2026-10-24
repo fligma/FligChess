@@ -11,7 +11,9 @@ This module is a leaf: it imports only the XP theme palette, never the app,
 so both ``ui.settings`` and ``fligchess`` can depend on it without a cycle.
 """
 
+import os
 import pathlib
+import sys
 
 from fligchess.ui import xp
 
@@ -19,7 +21,7 @@ from fligchess.ui import xp
 # The one place the app's version lives. Bump APP_VERSION by hand for a
 # release; the build workflow tags "fligchessV" + APP_VERSION, so repeated
 # pushes before a bump refresh the same release's assets.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 TAG_PREFIX = "fligchessV"
 
 
@@ -223,6 +225,36 @@ UI_FONT = "tahoma,verdana,segoeui,dejavusans"
 TITLEBAR_H = 28           # blue Luna caption strip
 MENUBAR_H = 22            # File/View/Game/Help strip
 STATUSBAR_H = 24          # bottom grip bar
+
+
+def client_can_place_window(video_driver=None, env=None, platform=None):
+    """Whether this app may move or resize its own window.
+
+    On Wayland the compositor owns placement: a client's request to move its
+    window is ignored, and an app-dragged titlebar leaves the window glued to
+    the spot it opened on. X11 honours those requests, as do Windows and
+    macOS, so the drawn caption belongs there. XWayland counts as Wayland -
+    the compositor still decides where the window goes.
+
+    Where this returns False the app keeps the system's own decorations and
+    leaves the caption strip undrawn, so the user drags a titlebar the
+    compositor will actually move. Each argument may be passed in (tests,
+    early startup) or read from the running environment."""
+    platform = sys.platform if platform is None else platform
+    if not platform.startswith("linux"):
+        return True
+    env = os.environ if env is None else env
+    driver = (video_driver or "").strip().lower()
+    if driver in ("dummy", "offscreen", "kmsdrm", "vbci"):
+        # no window manager involved: a headless run, or a bare console
+        # where the drawn caption is the only caption there will ever be
+        return True
+    if driver == "wayland":
+        return False
+    # no driver name to go on (before SDL answers): the session itself says
+    session = (env.get("XDG_SESSION_TYPE") or "").strip().lower()
+    return not (session == "wayland" or env.get("WAYLAND_DISPLAY"))
+
 
 # Windows XP "Luna" palette, aliased under the names the draw code uses
 COL_BG = xp.FACE                   # window face (#ECE9D8)

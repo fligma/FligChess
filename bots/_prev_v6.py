@@ -29,18 +29,18 @@ MATE_THRESHOLD = MATE - 10_000
 MAXPLY = 64
 INF = 10 ** 9
 
-VAL = (0, 100, 320, 330, 500, 900, 20000)     # per piece id (P..K)
+VAL = (0, 100, 270, 340, 560, 1000, 20000)     # per piece id (P..K)
 NV = (0, 0, 3, 3, 5, 9, 0)                    # phase weight per piece id
 
 # the moved-piece safety pass (see `blunder_pass`): how much the opponent
 # must stand to win for a capture to count as a hang, how close to the pick
 # a safe rival has to be before it may replace it, and how many rivals are
 # re-checked, safest first
-HANG_MIN = 150                # above a pawn, so a free-pawn push is not a
+HANG_MIN = 225                # above a pawn, so a free-pawn push is not a
                               # blunder - gambits and breaks are normal chess
-EQUAL_CP = 30
+EQUAL_CP = 0
 VERIFY_CAP = 8                # rivals given a fresh quiescence score
-VERIFIER_BUDGET = 0.5         # seconds the whole audit may take
+VERIFIER_BUDGET = 0.0         # seconds the whole audit may take
 
 N_DELTAS = (33, 18, -14, -31, -33, -18, 14, 31)       # 0x88 offsets
 DIAG = (17, 15, -17, -15)
@@ -134,8 +134,8 @@ PST_PG = {
         -50, -30, -30, -30, -30, -30, -30, -50),
 }
 # passed-pawn bonus by own rank (0 = own 2nd rank), indexed r = 0..7
-PASS_MG = (0, 5, 10, 20, 35, 60, 100, 0)
-PASS_PG = (0, 8, 16, 30, 55, 90, 140, 0)
+PASS_MG = (0, 2, 2, 15, 25, 45, 77, 0)
+PASS_PG = (0, 8, 13, 25, 44, 74, 115, 0)
 
 # ------------------------------------------------------------------ zobrist
 
@@ -161,15 +161,15 @@ def _ep_key(sq):
 # bishops/rooks/queens costs far too many nodes/second for a pure-python
 # search to be worth it, and rook/queen open files are already judged below.
 MOBILE = {N: (N_DELTAS, False)}
-MOBW = {N: 2}
+MOBW = {N: 1}
 
 # evaluation terms the piece-square tables cannot express: a piece standing
 # where an enemy pawn can chase it, a slider with its exits being closed, a
 # king bolted into its own pawn cage and a pawn backed by its neighbour
-HARASS = 10
-TRAPPED = 45
-CAGE = 20
-SUPPORT = 5
+HARASS = 24
+TRAPPED = 40
+CAGE = 5
+SUPPORT = 6
 
 
 def _exits(b, sq, t, own):
