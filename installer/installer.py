@@ -935,7 +935,23 @@ def _report_crash():
         pass
 
 
-def main():
+def main(argv=None):
+    """--selftest is the build workflow's probe, and opens no window: it
+    reports the interpreter, pygame and the bundled asset folder the frozen
+    bundle actually got, and fails if an asset is missing. A bundle that
+    cannot start then fails the build instead of somebody's desktop - which
+    is the only thing that can be done about a crash during interpreter
+    startup, since that is before any of this file exists."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if "--selftest" in argv:
+        logo = const.ASSETS_DIR / "logo.png"
+        print("FligChess installer %s\n  python %s\n  pygame %s\n  assets %s"
+              % (APP_VERSION, sys.version.split()[0], pygame.version.ver,
+                 const.ASSETS_DIR))
+        if not logo.exists():
+            print("  missing bundled asset: %s" % logo)
+            raise SystemExit(2)
+        return
     try:
         Installer().run()
     except (KeyboardInterrupt, SystemExit):

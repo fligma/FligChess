@@ -198,15 +198,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      # PyInstaller needs objcopy from binutils for its ELF bootloading
-      - run: sudo apt-get update && sudo apt-get install -y binutils
-      - run: pip install pygame pyinstaller
+      # No setup-python here on purpose. PyInstaller bundles the interpreter it
+      # runs under, and the prebuilt CPython setup-python downloads is compiled
+      # for its build host: on machines without those instructions the bundle
+      # dies with SIGILL inside libpython's load-time constructors, before
+      # Python exists, so the app cannot even print a traceback (observed as an
+      # instant exit with no window). Ubuntu's own python3 is built for the
+      # generic x86-64 baseline Ubuntu guarantees on every amd64 install, so
+      # that is the one worth inheriting. objcopy comes from binutils.
+      - name: Install the distro Python and the build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils python3-venv python3-dev libsdl2-dev
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install pygame pyinstaller
+          command -v python3
+          .venv/bin/python --version
+          .venv/bin/pyinstaller --version
       - name: Build one-file binary
         run: >
-          pyinstaller --noconfirm --onefile --name FligChess
+          .venv/bin/pyinstaller --noconfirm --onefile --name FligChess
           --paths src --add-data "src/fligchess/assets:fligchess/assets"
           src/fligchess/fligchess.py
       - name: Stage portable folder
@@ -219,7 +231,7 @@ jobs:
           cp src/fligchess/assets/logo.png dist/FligChess/logo.png
       - name: Record shipped bot versions
         run: |
-          python - <<'PY'
+          .venv/bin/python - <<'PY'
           import json, pathlib, re
           bots = []
           for meta in sorted(pathlib.Path("bots").glob("*.meta.json")):
@@ -234,10 +246,23 @@ jobs:
         run: (cd dist/FligChess && zip -r ../FligChess-linux.zip .)
       - name: Build the XP installer
         run: >
-          pyinstaller --noconfirm --onefile
+          .venv/bin/pyinstaller --noconfirm --onefile
           --name FligChess-Installer
           --paths src --add-data "src/fligchess/assets:fligchess/assets"
           installer/installer.py
+      - name: Smoke-run the bundled installer
+        # --selftest opens no window and exits 0 once the interpreter, pygame
+        # and the bundled assets are intact. A crash while the interpreter
+        # itself loads is invisible to Python - it shows up here as exit 132
+        # (SIGILL) instead of as somebody's blank desktop.
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: |
+          dist/FligChess-Installer-linux --selftest || rc=$?
+          [ "${rc:-0}" -eq 0 ] || {
+            echo "::error::bundled installer did not start cleanly (exit ${rc:-0})" >&2
+            exit "${rc:-1}"
+          }
       - name: Name the installer asset
         run: mv dist/FligChess-Installer dist/FligChess-Installer-linux
       - name: Hand the release files to the publish job
