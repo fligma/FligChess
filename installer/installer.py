@@ -17,12 +17,14 @@ FligChess-Installer executable that ships beside the app itself.
 
 import os
 import ctypes
+import ctypes.util
 import json
 import pathlib
 import subprocess
 import sys
 import threading
 import time
+import traceback
 
 # make the fligchess package importable when run straight from a checkout
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -82,26 +84,40 @@ def _set_win_app_id():
 def _load_sdl_dll():
     """The SDL2 library pygame links against, only for the desktop-wide mouse
     position (the one stable anchor while a borderless window slides under the
-    cursor). None when it cannot be found, so dragging simply degrades."""
+    cursor). None when it cannot be found, so dragging simply degrades. A
+    PyInstaller bundle hoists the library out of pygame's own folder, so the
+    bundle root, the loader's default search and the system lookup all get a
+    try - the same ladder the app uses, and the reason the two stay in step."""
     if sys.platform == "win32":
         names = ["SDL2.dll"]
     elif sys.platform == "darwin":
         names = ["libSDL2.dylib", "libSDL2-2.0.0.dylib"]
     else:
         names = ["libSDL2-2.0.so.0", "libSDL2-2.0.so", "libSDL2.so"]
-    pkg = pathlib.Path(pygame.__file__).resolve().parent
-    for name in names:
-        path = pkg / name
-        if path.exists():
-            try:
-                return ctypes.CDLL(str(path))
-            except OSError:
-                pass
+    roots = [pathlib.Path(pygame.__file__).resolve().parent]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(pathlib.Path(meipass))
+    for root in roots:
+        for name in names:
+            path = root / name
+            if path.exists():
+                try:
+                    return ctypes.CDLL(str(path))
+                except OSError:
+                    pass
     for name in names:
         try:
             return ctypes.CDLL(name)
         except OSError:
             pass
+    try:
+        found = ctypes.util.find_library("SDL2") or ctypes.util.find_library(
+            names[0])
+        if found:
+            return ctypes.CDLL(found)
+    except (OSError, ValueError):
+        pass
     return None
 
 
@@ -199,7 +215,15 @@ class Installer:
 
     def _video_driver(self):
         """SDL's name for the video backend in use ("x11", "wayland",
-        "windows", "cocoa", "dummy"), or "" when it will not say."""
+        "windows", "cocoa", "dummy"), or "" when it will not say. pygame is
+        asked first - it always knows which backend it opened - and the ctypes
+        read is the back-up for a build that cannot reach its own SDL library."""
+        try:
+            name = pygame.display.get_driver() or ""
+        except (pygame.error, AttributeError):
+            name = ""
+        if name:
+            return name
         if self._dll is None:
             return ""
         try:
@@ -842,8 +866,83 @@ class Installer:
         pygame.quit()
 
 
+def _error_log_paths():
+    """Where a fatal failure is written down, best place first: beside the
+    executable in a bundled build, beside this script in a checkout, and in
+    the home folder when the program's own folder will not take a file. A
+    crash on somebody else's machine has to leave something behind to read."""
+    base = (pathlib.Path(sys.executable).resolve().parent
+            if getattr(sys, "frozen", False)
+            else pathlib.Path(__file__).resolve().parent)
+    out = [base / "FligChess-Installer-error.txt"]
+    try:
+        out.append(pathlib.Path.home() / "FligChess-Installer-error.txt")
+    except RuntimeError:
+        pass                                  # no home directory to fall back on
+    return out
+
+
+def _hold_open():
+    """Keep a crash note on screen until it has been seen: one click, a key,
+    a close request, or two minutes - whichever comes first. A window that
+    opens and vanishes in a blink tells the user nothing."""
+    clock = pygame.time.Clock()
+    t0 = time.time()
+    while time.time() - t0 < 120:
+        for event in pygame.event.get():
+            if event.type in (pygame.QUIT, pygame.MOUSEBUTTONDOWN,
+                              pygame.KEYDOWN):
+                return
+        clock.tick(20)
+
+
+def _report_crash():
+    """Make a failure legible instead of silent: the traceback goes to the
+    console and into a file, and where a window did open its last line and
+    the file's address are painted there and held. Never fatal itself - the
+    original error is what the caller still exits on."""
+    text = traceback.format_exc()
+    sys.stderr.write(text + "\n")
+    where = None
+    for log in _error_log_paths():
+        try:
+            log.write_text("FligChess installer %s\n\n%s" % (APP_VERSION,
+                                                              text),
+                           encoding="utf-8")
+            where = str(log)
+            break
+        except OSError:
+            continue
+    if where is None:
+        where = "no log file could be written"
+    try:
+        screen = pygame.display.get_surface()
+        if screen is None:
+            return
+        small = pygame.font.SysFont(UI_FONT, 12)
+        big = pygame.font.SysFont(UI_FONT, 15, bold=True)
+        lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+        screen.fill(xp.FACE)
+        screen.blit(big.render("FligChess installer stopped unexpectedly",
+                               True, xp.TEXT), (16, 14))
+        screen.blit(small.render((lines[-1] if lines else "?")[:120], True,
+                                 xp.TEXT), (16, 44))
+        screen.blit(small.render("Details: " + where, True, xp.TEXT_MUTED),
+                    (16, 64))
+        pygame.display.flip()
+        _hold_open()
+    except Exception:
+        pass
+
+
 def main():
-    Installer().run()
+    try:
+        Installer().run()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:                # a crash must never leave no trace
+        _report_crash()
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -232,9 +232,16 @@ def client_can_place_window(video_driver=None, env=None, platform=None):
 
     On Wayland the compositor owns placement: a client's request to move its
     window is ignored, and an app-dragged titlebar leaves the window glued to
-    the spot it opened on. X11 honours those requests, as do Windows and
-    macOS, so the drawn caption belongs there. XWayland counts as Wayland -
-    the compositor still decides where the window goes.
+    the spot it opened on. Every other backend SDL names - x11, windows,
+    cocoa - honours those requests, so the drawn caption belongs there.
+
+    What the backend *says* outranks what the session *looks like*. An X11
+    client under a Wayland desktop (XWayland) answers "x11", and the
+    compositor does move that window when the client asks; WAYLAND_DISPLAY in
+    the environment describes the session, not the toolkit this window talks
+    through, so reading it there threw the drawn caption away and left a
+    perfectly good drag dead. The environment only gets the vote when SDL will
+    not name a backend at all, and there it errs toward the system titlebar.
 
     Where this returns False the app keeps the system's own decorations and
     leaves the caption strip undrawn, so the user drags a titlebar the
@@ -249,8 +256,8 @@ def client_can_place_window(video_driver=None, env=None, platform=None):
         # no window manager involved: a headless run, or a bare console
         # where the drawn caption is the only caption there will ever be
         return True
-    if driver == "wayland":
-        return False
+    if driver:
+        return driver != "wayland"
     # no driver name to go on (before SDL answers): the session itself says
     session = (env.get("XDG_SESSION_TYPE") or "").strip().lower()
     return not (session == "wayland" or env.get("WAYLAND_DISPLAY"))

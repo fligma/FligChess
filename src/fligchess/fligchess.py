@@ -85,7 +85,9 @@ def _load_sdl_dll():
     """The very SDL2 library pygame links against, for absolute mouse and
     work-area queries (only reachable through ctypes).  Works on Windows
     (SDL2.dll next to pygame), Linux (bundled libSDL2-2.0.so.0 in the
-    wheel, or the system copy) and macOS."""
+    wheel, or the system copy) and macOS. A PyInstaller bundle hoists these
+    libraries out of pygame's folder, so the bundle root and the system
+    loader both get a try before the answer is 'not available'."""
     if sys.platform == "win32":
         names = ["SDL2.dll"]
     elif sys.platform == "darwin":
@@ -93,13 +95,18 @@ def _load_sdl_dll():
     else:
         names = ["libSDL2-2.0.so.0", "libSDL2-2.0.so", "libSDL2.so"]
     pkg = pathlib.Path(pygame.__file__).resolve().parent
-    for name in names:                      # 1. pygame's own bundled copy
-        path = pkg / name
-        if path.exists():
-            try:
-                return ctypes.CDLL(str(path))
-            except OSError:
-                pass
+    roots = [pkg]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(pathlib.Path(meipass))
+    for root in roots:                    # 1. the copy pygame itself carries
+        for name in names:
+            path = root / name
+            if path.exists():
+                try:
+                    return ctypes.CDLL(str(path))
+                except OSError:
+                    pass
     for name in names:                      # 2. loader default search
         try:
             return ctypes.CDLL(name)
@@ -479,7 +486,17 @@ class ChessApp:
 
     def _video_driver(self):
         """SDL's name for the video backend in use ("x11", "wayland",
-        "windows", "cocoa", "dummy"), or "" when it will not say."""
+        "windows", "cocoa", "dummy"), or "" when it will not say. pygame is
+        asked first, because it always knows which backend it opened; the
+        ctypes read is only a back-up for a build that cannot reach its own
+        SDL library (a bundled Linux app keeps the library outside pygame's
+        folder, where the lookup below cannot see it)."""
+        try:
+            name = pygame.display.get_driver() or ""
+        except (pygame.error, AttributeError):
+            name = ""
+        if name:
+            return name
         if self._dll is None:
             return ""
         try:
